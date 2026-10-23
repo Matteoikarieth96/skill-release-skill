@@ -1,0 +1,13 @@
+{
+  "github_owner": "your-github-name",
+  "copyright_holder": "your-github-name",
+  "author_identities": ["your-github-name <12345678+your-github-name@users.noreply.github.com>"],
+  "allowed_emails": [],
+  "private_terms_file": "private-terms.txt",
+  "banned_text": [],
+  "require_intake": true,
+  "projects_dir": "~/projects",
+  "reports_dir": "~/projects/skill-release-reports",
+  "skills_dir": "~/.claude/skills",
+  "post_publish_commands": []
+}

@@ -338,6 +338,17 @@ class Media(Base):
         self.assertIn("gps-location", self.checks(rep, "FAIL"))
         self.assertTrue(any("Artist" in f.message for f in rep.findings))
 
+    def test_app13_only_warns_with_iptc(self):
+        seg = lambda p: b"\xff\xed" + struct.pack(">H", len(p) + 2) + p  # noqa: E731
+        base = jpeg()
+        empty = base[:2] + seg(b"Photoshop 3.0\x008BIM\x04\x25\0\0\0\0\0\x10" + bytes(16)) + base[2:]
+        write(self.root, "a.jpg", empty)
+        self.assertNotIn("photo-metadata", self.checks(self.scan(), "WARN"))
+        iptc = base[:2] + seg(b"Photoshop 3.0\x008BIM\x04\x04\0\0\0\0\0\x08\x1c\x02\x50\0\x04Jane") + base[2:]
+        p = write(self.root, "a.jpg", iptc)
+        self.assertIn("photo-metadata", self.checks(self.scan(), "WARN"))
+        self.assertIn("APP13", rs.strip_file(p))
+
     def test_rotated_jpeg_needs_force(self):
         p = write(self.root, "r.jpg", jpeg(tiff([(0x0112, 6)])))
         with self.assertRaises(ValueError):
@@ -505,6 +516,21 @@ class History(Base):
         self.assertIn("commit-identity", fails)
         cfg = self.config(author_identities=["Test Author <test@example.com>"])
         self.assertNotIn("commit-identity", self.checks(self.scan(cfg), "FAIL"))
+
+    def test_platform_identities_are_not_fail(self):
+        self.commit()
+        env = dict(os.environ, GIT_AUTHOR_NAME="dependabot[bot]",
+                   GIT_AUTHOR_EMAIL="49699333+dependabot[bot]@users.noreply.github.com",
+                   GIT_COMMITTER_NAME="GitHub", GIT_COMMITTER_EMAIL="noreply@github.com")
+        write(self.root, "x.md", "bump\n")
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True, env=env)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-q", "-m",
+                        "Bump x\n\nSigned-off-by: dependabot[bot] <support" + "@github.com>"],
+                       check=True, env=env)
+        cfg = self.config(author_identities=["Test Author <test@example.com>"])
+        rep = self.scan(cfg)
+        self.assertNotIn("commit-identity", self.checks(rep, "FAIL"))
+        self.assertNotIn("email", self.checks(rep, "WARN"))
 
     def test_untracked_file_is_scanned(self):
         self.commit()

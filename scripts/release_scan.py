@@ -307,9 +307,14 @@ def luhn_valid(num: str) -> bool:
     return total % 10 == 0
 
 
+PUBLIC_SERVICE_EMAILS = {"support@github.com", "noreply@github.com"}
+PLATFORM_IDENTITY = re.compile(
+    r"^(?:GitHub <noreply@github\.com>|[^<>]*\[bot\] <[^<>]*\[bot\]@users\.noreply\.github\.com>)$")
+
+
 def email_allowed(local: str, domain: str, tld: str, cfg) -> bool:
     l, d = local.lower(), domain.lower()
-    if f"{l}@{d}" in {e.lower() for e in cfg["allowed_emails"]}:
+    if f"{l}@{d}" in {e.lower() for e in cfg["allowed_emails"]} | PUBLIC_SERVICE_EMAILS:
         return True
     if tld.lower() in FILE_EXT_TLDS:
         return True
@@ -609,7 +614,12 @@ def scan_jpeg(data, where, rep, cfg):
         elif marker == 0xE1 and b"ns.adobe.com/xap" in payload[:64]:
             _xmp(payload, where, rep, cfg)
         elif marker == 0xED:
-            rep.add("WARN", "photo-metadata", where, "IPTC / Photoshop block (APP13)")
+            if b"8BIM\x04\x04" in payload:
+                rep.add("WARN", "photo-metadata", where,
+                        "IPTC block (APP13): can hold author, caption and place fields")
+                _terms_in_strings([payload.decode("latin-1")], where, rep, cfg)
+            else:
+                rep.add("INFO", "photo-metadata", where, "Photoshop block (APP13) with no IPTC data")
         elif marker == 0xFE:
             rep.add("WARN", "photo-metadata", where, f"JPEG comment: {clean(payload, 50)!r}")
             _terms_in_strings([payload.decode("latin-1")], where, rep, cfg)
@@ -998,7 +1008,9 @@ def scan_commits(root: Path, rep: Report, cfg):
         scan_text(body, f"commit {sha[:7]}", rep, cfg, origin="message", full=False)
     allowed = set(cfg["author_identities"])
     for ident, n in sorted(identities.items()):
-        if allowed and ident not in allowed:
+        if PLATFORM_IDENTITY.match(ident):
+            rep.add("INFO", "commit-identity", "git", f"platform identity (merges, bots): {clean(ident, 70)} ({n})")
+        elif allowed and ident not in allowed:
             rep.add("FAIL", "commit-identity", "git", f"identity not in author_identities: {clean(ident, 70)} ({n})")
         else:
             rep.add("INFO", "commit-identity", "git", f"public on GitHub: {clean(ident, 70)} ({n})")

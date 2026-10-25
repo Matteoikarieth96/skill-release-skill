@@ -61,8 +61,8 @@ Requirements:
 - The GitHub CLI `gh`, logged in to your account (the intake already checks the
   repo name with it), recent enough to have
   `gh repo edit --accept-visibility-change-consequences`.
-- [gitleaks](https://github.com/gitleaks/gitleaks) strongly recommended; the
-  built-in secret rules are a subset.
+- [gitleaks](https://github.com/gitleaks/gitleaks): the scan FAILs without it
+  unless you pass `--no-gitleaks` (the built-in secret rules are a subset).
 
 ## Your private settings
 
@@ -120,9 +120,12 @@ rewrites the files **in place**: run it on the staging copy, naming each file
 ## Security
 
 The scanner reads untrusted folders: it never follows symlinks, never runs
-code from the scanned repo, calls git and gitleaks with argument lists, caps
-file and history sizes, guards its image, PDF and archive parsers against
-malformed and oversized input, and masks every secret it prints. `strip`
+code from the scanned repo, refuses to run git in a folder whose `.git` config
+is not plain, runs gitleaks so that the repo cannot silence it, reads text
+hidden under media extensions, in UTF-16 or behind NUL bytes, caps file and
+history sizes, guards its image, PDF and archive parsers against malformed and
+oversized input, prints file names and messages as single clean lines, and
+masks every secret it prints. `strip`
 writes atomically and refuses symlinks. `repo_settings.py` validates the repo
 name, touches only that repo and never changes its visibility. Details and
 residual risks: [SECURITY.md](SECURITY.md).

@@ -22,6 +22,8 @@ Standard library only, Python 3.9 or newer.
 from __future__ import annotations
 
 import argparse
+import bisect
+import codecs
 import fnmatch
 import hashlib
 import json
@@ -33,6 +35,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import zipfile
 import zlib
 from dataclasses import asdict, dataclass
@@ -88,8 +91,10 @@ class Report:
 
 
 def mask(secret: str) -> str:
+    """First 4 characters, the length and a short fingerprint that tells two secrets apart."""
     secret = secret.strip()
-    return f"{secret[:4]}...({len(secret)} chars)"
+    tag = hashlib.sha256(secret.encode("utf-8", "replace")).hexdigest()[:6]
+    return f"{secret[:4]}...({len(secret)} chars, #{tag})"
 
 
 def clean(value, limit=80) -> str:
@@ -100,8 +105,15 @@ def clean(value, limit=80) -> str:
     return value if len(value) <= limit else value[:limit] + "..."
 
 
+_LINES: list = [None, []]
+
+
 def line_of(text: str, pos: int) -> int:
-    return text.count("\n", 0, pos) + 1
+    """1-based line of a position; newline offsets are cached for the text being scanned."""
+    if _LINES[0] is not text:
+        _LINES[0] = text
+        _LINES[1] = [m.start() for m in re.finditer("\n", text)]
+    return bisect.bisect_left(_LINES[1], pos) + 1
 
 
 # ------------------------------------------------------------------- config
@@ -153,6 +165,8 @@ def load_config(path=None) -> dict:
                 terms.append(term)
     cfg["_terms"] = sorted({t for t in terms if t}, key=lambda t: (-len(t), t.lower()))
     cfg["_terms_re"] = _terms_regex(cfg["_terms"])
+    # Bytes of binary files hit short terms by chance: only terms of 5+ characters there.
+    cfg["_terms_re_long"] = _terms_regex([t for t in cfg["_terms"] if len(t) >= 5])
     cfg["_source"] = source
     cfg["_terms_file"] = str(tf) if tf.is_file() else ""
     return cfg
@@ -249,9 +263,68 @@ USB_SERIAL = re.compile(
 LOCAL_HOST = re.compile(r"(?<![.\w-])([A-Za-z0-9-]{3,63})\.local\b(?!\.[A-Za-z])")
 CURL_PIPE_SHELL = re.compile(r"(?:curl|wget)[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b")
 PLACEHOLDER_LEFT = re.compile(r"\{\{[A-Z][A-Z0-9_]*\}\}")
-HIDDEN_CHARS = re.compile("[\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff"
-                          "\U000e0000-\U000e007f]")
-HTML_COMMENT = re.compile(r"<!--(.*?)-->", re.S)
+NON_PLAIN = re.compile(r"[^\x09\x0a\x0d\x20-\x7e]")
+INVISIBLE_EXTRA = {0x034F, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x180E}
+GITLEAKS_ALLOW = "gitleaks" + ":allow"
+CONFIG_EXT = {"", ".env", ".envrc", ".ini", ".cfg", ".conf", ".properties", ".toml", ".yaml", ".yml",
+              ".txt", ".sh", ".bash", ".zsh"}
+GENERIC_UNQUOTED = re.compile(
+    r"(?im)^[ \t]*(?:export[ \t]+)?([A-Z0-9_.-]{0,40}(?:PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY)"
+    r"[A-Z0-9_.-]{0,40})[ \t]*[=:][ \t]*([^\s\"'#]{8,200})[ \t]*$")
+
+
+def _emoji_base(ch: str) -> bool:
+    return unicodedata.category(ch) in ("So", "Sm", "Sk", "No") or ch in "0123456789#*\ufe0f"
+
+
+def hidden_chars(text: str):
+    """Yields (position, codepoint, severity) for characters that can hide or reorder text.
+
+    FAIL: format characters (bidi controls, zero-width, tags), line and paragraph
+    separators, variation selectors outside an emoji, invisible fillers, ESC and
+    C1 controls. WARN: other C0 controls, private-use and unassigned characters.
+    "BOM": a byte order mark at the very start.
+    """
+    n = len(text)
+    for m in NON_PLAIN.finditer(text):
+        i = m.start()
+        ch = m.group(0)
+        cp = ord(ch)
+        if cp < 0x20 or cp == 0x7F or 0x80 <= cp <= 0x9F:
+            yield i, cp, ("FAIL" if cp == 0x1B or cp >= 0x80 else "WARN")
+            continue
+        if cp == 0xFEFF and i == 0:
+            yield i, cp, "BOM"
+            continue
+        prev = text[i - 1] if i else ""
+        nxt = text[i + 1] if i + 1 < n else ""
+        if cp in (0xFE0E, 0xFE0F):
+            if prev and prev not in "\ufe0e\ufe0f" and _emoji_base(prev) and nxt not in ("\ufe0e", "\ufe0f"):
+                continue
+            yield i, cp, "FAIL"
+            continue
+        if cp == 0x200D and prev and nxt and _emoji_base(prev) and _emoji_base(nxt):
+            continue
+        cat = unicodedata.category(ch)
+        if cat in ("Cf", "Zl", "Zp") or cp in INVISIBLE_EXTRA or 0xFE00 <= cp <= 0xFE0F \
+                or 0xE0100 <= cp <= 0xE01EF:
+            yield i, cp, "FAIL"
+        elif cat in ("Co", "Cn"):
+            yield i, cp, "WARN"
+
+
+def html_comments(text: str):
+    """(position, body) of each HTML comment, found without backtracking."""
+    i = text.find("<!--")
+    while i != -1:
+        j = text.find("-->", i + 4)
+        if j == -1:
+            yield i, text[i + 4:i + 200]
+            return
+        yield i, text[i + 4:j]
+        i = text.find("<!--", j + 3)
+
+
 MEMORY_MARKER = "origin" + "SessionId"
 TRANSCRIPT_MARKER = re.compile(r"\"session" + r"Id\"\s*:")
 
@@ -287,7 +360,7 @@ CODE_RULES = [
      "recursive delete"),
     ("INFO", "sudo", re.compile(r"\bsudo\s"), "uses sudo"),
 ]
-SCRIPT_SRC = re.compile(r"<script\b[^>]*\bsrc\s*=\s*[\"']https?://[^\"']+[\"'][^>]*>", re.I)
+SCRIPT_SRC = re.compile(r"<script\b[^>]{0,2000}\bsrc[ \t]*=[ \t]*[\"']https?://[^\"'\s>]{1,1000}[\"'][^>]{0,2000}>", re.I)
 
 
 def iban_valid(raw: str) -> bool:
@@ -333,11 +406,13 @@ PLACEHOLDER_LOGINS = {"user", "username", "login", "name", "admin", "pass", "pwd
 
 
 def scan_text(text: str, path: str, rep: Report, cfg, *, ext: str = "", origin: str = "",
-              full: bool = True):
+              full: bool = True, leak_only: bool = False, binary: bool = False):
     """Content rules for one text: a file, a history blob or a commit message.
 
-    full=False (history and commit messages) keeps the leak rules and drops the
-    style, inventory and code rules, which only matter for the current files.
+    full=False (history, commit messages, document parts) keeps the leak and
+    personal-data rules and drops the style, inventory and code rules.
+    leak_only=True (bytes of binary files read as latin-1) keeps only the FAIL
+    rules for secrets, private terms and Claude files.
     """
     where = f"{path} ({origin})" if origin else path
     covered: list = []
@@ -354,9 +429,8 @@ def scan_text(text: str, path: str, rep: Report, cfg, *, ext: str = "", origin: 
         for m in rx.finditer(text):
             fail_secret(check, m)
     for m in URL_CREDENTIALS.finditer(text):
-        user, pwd = m.group(1), m.group(2)
-        if not is_placeholder(pwd) and pwd.lower() not in PLACEHOLDER_LOGINS \
-                and user.lower() not in PLACEHOLDER_LOGINS:
+        pwd = m.group(2)
+        if not is_placeholder(pwd) and pwd.lower() not in PLACEHOLDER_LOGINS:
             fail_secret("url-credentials", m, pwd)
     for m in ARDUINO_SECRET.finditer(text):
         if m.group(2) and not is_placeholder(m.group(2)):
@@ -371,17 +445,10 @@ def scan_text(text: str, path: str, rep: Report, cfg, *, ext: str = "", origin: 
         if not is_placeholder(m.group(2)):
             rep.add("FAIL", "wifi-password", where,
                     f"WiFi.begin with a literal password {mask(m.group(2))}", line_of(text, m.start()))
-    for m in GENERIC_SECRET.finditer(text):
-        val = m.group(2)
-        if is_placeholder(val) or any(a <= m.start(2) < b for a, b in covered):
-            continue
-        rep.add("WARN", "secret-assignment", where,
-                f"{m.group(1)} assigned a literal {mask(val)}: confirm it is not real",
-                line_of(text, m.start()))
     for m in HEX64.finditer(text):
         start = text.rfind("\n", 0, m.start()) + 1
         end = text.find("\n", m.end())
-        line = text[start:end if end != -1 else len(text)]
+        line = text[start:end if end != -1 else len(text)][:2000]
         if CRYPTO_KEY_LINE.search(line):
             rep.add("FAIL", "crypto-private-key", where,
                     f"64-hex value next to a key word {mask(m.group(0))}", line_of(text, m.start()))
@@ -389,8 +456,9 @@ def scan_text(text: str, path: str, rep: Report, cfg, *, ext: str = "", origin: 
         rep.add("FAIL", "seed-phrase", where, "looks like a wallet seed phrase",
                 line_of(text, m.start()))
 
-    if cfg.get("_terms_re"):
-        for m in cfg["_terms_re"].finditer(text):
+    terms_rx = cfg.get("_terms_re_long" if binary else "_terms_re")
+    if terms_rx:
+        for m in terms_rx.finditer(text):
             rep.add("FAIL", "private-term", where, f"private term {clean(m.group(0), 40)!r}",
                     line_of(text, m.start()))
 
@@ -398,15 +466,37 @@ def scan_text(text: str, path: str, rep: Report, cfg, *, ext: str = "", origin: 
         rep.add("FAIL", "claude-memory", where, "looks like a Claude memory file")
     if ext == ".jsonl" and TRANSCRIPT_MARKER.search(text):
         rep.add("FAIL", "claude-transcript", where, "looks like a Claude session transcript")
+    if leak_only:
+        return
+
+    for m in GENERIC_SECRET.finditer(text):
+        val = m.group(2)
+        if is_placeholder(val) or any(a <= m.start(2) < b for a, b in covered):
+            continue
+        rep.add("WARN", "secret-assignment", where,
+                f"{m.group(1)} assigned a literal {mask(val)}: confirm it is not real",
+                line_of(text, m.start()))
+    base = path.rsplit("/", 1)[-1].lower()
+    config_like = ext in CONFIG_EXT or base.startswith((".env", "env."))
+    for m in (GENERIC_UNQUOTED.finditer(text) if config_like else ()):
+        val = m.group(2)
+        if is_placeholder(val) or any(a <= m.start(2) < b for a, b in covered):
+            continue
+        rep.add("WARN", "secret-assignment", where,
+                f"{clean(m.group(1), 40)} set to an unquoted literal {mask(val)}: confirm it is not real",
+                line_of(text, m.start()))
 
     for m in EMAIL.finditer(text):
+        if any(a <= m.start() < b for a, b in covered):
+            continue
         if not email_allowed(m.group(1), m.group(2), m.group(3), cfg):
-            rep.add("WARN", "email", where, f"email address {clean(m.group(0), 60)}",
+            rep.add("WARN", "email", where,
+                    f"email address {clean(m.group(1)[:2], 4)}...@{clean(m.group(2), 50)}",
                     line_of(text, m.start()))
     for m in PHONE.finditer(text):
         digits = re.sub(r"\D", "", m.group(0))
         if 9 <= len(digits) <= 15:
-            rep.add("WARN", "phone", where, f"phone number {clean(m.group(0), 30)}",
+            rep.add("WARN", "phone", where, f"phone number {mask(digits)}",
                     line_of(text, m.start()))
     for m in IBAN.finditer(text):
         if iban_valid(m.group(1)):
@@ -444,26 +534,32 @@ def scan_text(text: str, path: str, rep: Report, cfg, *, ext: str = "", origin: 
         rep.add("WARN", "local-hostname", where, f"local host name {clean(m.group(0), 50)}",
                 line_of(text, m.start()))
 
-    for m in HIDDEN_CHARS.finditer(text):
-        cp = ord(m.group(0))
-        if cp == 0xFEFF and m.start() == 0:
+    for pos, cp, sev in hidden_chars(text):
+        if sev == "BOM":
             if full:
                 rep.add("WARN", "bom", where, "file starts with a byte order mark")
             continue
-        rep.add("FAIL", "hidden-unicode", where,
-                f"invisible or direction-changing character U+{cp:04X}: can hide text from reviewers",
-                line_of(text, m.start()))
+        if sev == "WARN" and not full:
+            continue
+        rep.add(sev, "hidden-unicode", where,
+                f"invisible, control or direction-changing character U+{cp:04X}: "
+                "can hide text from reviewers", line_of(text, pos))
     if not full:
         return
     for m in CURL_PIPE_SHELL.finditer(text):
         rep.add("WARN", "curl-pipe-shell", where,
                 "download piped into a shell: never run it on the reviewer's machine",
                 line_of(text, m.start()))
+    idx = text.find(GITLEAKS_ALLOW)
+    if idx != -1:
+        rep.add("WARN", "gitleaks-allow", where,
+                "inline gitleaks allow-comment: it silences gitleaks elsewhere (this scan ignores it)",
+                line_of(text, idx))
     if ext == ".md":
-        for m in HTML_COMMENT.finditer(text):
+        for pos, body in html_comments(text):
             rep.add("INFO", "hidden-comment", where,
-                    f"HTML comment, not shown when rendered: {clean(m.group(1).strip(), 60)!r}",
-                    line_of(text, m.start()))
+                    f"HTML comment, not shown when rendered: {clean(body.strip(), 60)!r}",
+                    line_of(text, pos))
     for banned in cfg["banned_text"]:
         idx = text.find(banned)
         while idx != -1:
@@ -577,13 +673,32 @@ def _terms_in_strings(texts, where, rep, cfg):
             rep.add("FAIL", "private-term", where, f"private term {clean(m.group(0), 40)!r} in metadata")
 
 
-def jpeg_segments(data: bytes):
-    """Yields (marker, start, end, payload) for each segment before the scan data."""
+def jpeg_walk(data: bytes):
+    """Every marker segment of a JPEG, also between and after the scans, up to EOI.
+
+    Yields (marker, start, end, payload). Entropy-coded scan data is skipped by
+    looking for the next real marker (FF followed by anything but 00, RSTn, FF).
+    """
     if data[:2] != b"\xff\xd8":
         return
-    i = 2
     n = len(data)
+    i = 2
+    in_scan = False
     while i < n:
+        if in_scan:
+            j = data.find(b"\xff", i)
+            if j == -1:
+                return
+            k = j + 1
+            while k < n and data[k] == 0xFF:
+                k += 1
+            if k >= n:
+                return
+            if data[k] == 0x00 or 0xD0 <= data[k] <= 0xD7:
+                i = k + 1
+                continue
+            i = k - 1
+            in_scan = False
         if data[i] != 0xFF:
             return
         while i < n and data[i] == 0xFF:
@@ -596,6 +711,7 @@ def jpeg_segments(data: bytes):
         if marker == 0x01 or 0xD0 <= marker <= 0xD8:
             continue
         if marker == 0xD9:
+            yield marker, start, i, b""
             return
         if i + 2 > n:
             return
@@ -603,26 +719,49 @@ def jpeg_segments(data: bytes):
         if seglen < 2 or i + seglen > n:
             return
         yield marker, start, i + seglen, data[i + 2:i + seglen]
-        if marker == 0xDA:
-            return
         i += seglen
+        if marker == 0xDA:
+            in_scan = True
+
+
+jpeg_segments = jpeg_walk
 
 
 def jpeg_orientation(data: bytes):
-    for marker, _s, _e, payload in jpeg_segments(data):
+    for marker, _s, _e, payload in jpeg_walk(data):
         if marker == 0xE1 and payload.startswith(b"Exif\0\0"):
             return parse_tiff(payload[6:]).get("ifd0", {}).get(0x0112)
     return None
 
 
+XMP_HEADERS = (b"ns.adobe.com/xap", b"ns.adobe.com/xmp/extension")
+
+
+def iptc_size(payload: bytes) -> int:
+    """Size of the IPTC resource (8BIM 0x0404) in a Photoshop APP13 block, 0 if absent or empty."""
+    i = payload.find(b"8BIM\x04\x04")
+    if i == -1 or i + 7 > len(payload):
+        return 0
+    name_len = payload[i + 6]
+    j = i + 6 + ((1 + name_len + 1) & ~1)
+    if j + 4 > len(payload):
+        return 1
+    return struct.unpack(">I", payload[j:j + 4])[0]
+
+
 def scan_jpeg(data, where, rep, cfg):
-    for marker, _s, _e, payload in jpeg_segments(data):
-        if marker == 0xE1 and payload.startswith(b"Exif\0\0"):
+    exif_at, xmp_ranges, eoi = set(), [], None
+    for marker, start, end, payload in jpeg_walk(data):
+        if marker == 0xD9:
+            eoi = end
+        elif marker == 0xE1 and payload.startswith(b"Exif\0\0"):
+            exif_at.add(start + 4)
             report_tiff(parse_tiff(payload[6:]), where, rep, cfg)
-        elif marker == 0xE1 and b"ns.adobe.com/xap" in payload[:64]:
+        elif marker == 0xE1 and any(h in payload[:80] for h in XMP_HEADERS):
+            xmp_ranges.append((start, end))
             _xmp(payload, where, rep, cfg)
         elif marker == 0xED:
-            if b"8BIM\x04\x04" in payload:
+            if iptc_size(payload) > 0:
                 rep.add("WARN", "photo-metadata", where,
                         "IPTC block (APP13): can hold author, caption and place fields")
                 _terms_in_strings([payload.decode("latin-1")], where, rep, cfg)
@@ -630,21 +769,41 @@ def scan_jpeg(data, where, rep, cfg):
                 rep.add("INFO", "photo-metadata", where, "Photoshop block (APP13) with no IPTC data")
         elif marker == 0xFE:
             rep.add("WARN", "photo-metadata", where, f"JPEG comment: {clean(payload, 50)!r}")
-            _terms_in_strings([payload.decode("latin-1")], where, rep, cfg)
+        elif 0xE3 <= marker <= 0xEF and marker != 0xEE:
+            rep.add("INFO", "photo-metadata", where, f"APP{marker - 0xE0} block: strip removes it")
+    pos = data.find(b"Exif\0\0")
+    while pos != -1:
+        if pos not in exif_at:
+            rep.add("WARN", "photo-metadata", where, "Exif block outside the image header")
+            report_tiff(parse_tiff(data[pos + 6:pos + 6 + 65536]), where, rep, cfg)
+        pos = data.find(b"Exif\0\0", pos + 1)
+    pos = data.find(b"<x:xmpmeta")
+    while pos != -1:
+        if not any(a <= pos < b for a, b in xmp_ranges):
+            rep.add("WARN", "photo-metadata", where, "XMP block outside the image header")
+            _xmp(data[pos:pos + 262144], where, rep, cfg)
+        pos = data.find(b"<x:xmpmeta", pos + 1)
+    if eoi is None:
+        rep.add("WARN", "photo-metadata", where, "no end-of-image marker: truncated or not a plain JPEG")
+    elif eoi < len(data):
+        rep.add("WARN", "photo-metadata", where,
+                f"{len(data) - eoi} bytes after the end of the image: strip removes them")
 
 
 def _xmp(payload: bytes, where, rep, cfg):
     text = payload.decode("utf-8", "replace")
     if re.search(r"GPS(?:Latitude|Longitude)", text):
         rep.add("FAIL", "gps-location", where, "XMP GPS location: strip it before publishing")
-    names = re.findall(r"<(?:dc:creator|xmp:CreatorTool|photoshop:AuthorsPosition|exif:\w+)", text)
+    names = re.findall(r"<(dc:creator|xmp:CreatorTool|photoshop:AuthorsPosition|exif:\w{1,40})", text)
     rep.add("WARN", "photo-metadata", where,
-            "XMP metadata block" + (f" ({', '.join(sorted(set(n[1:] for n in names)))[:80]})" if names else ""))
+            "XMP metadata block" + (f" ({', '.join(sorted(set(names)))[:80]})" if names else ""))
     _terms_in_strings([text], where, rep, cfg)
 
 
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
-PNG_META = {b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"tIME"}
+PNG_SAFE = {b"IHDR", b"PLTE", b"IDAT", b"IEND", b"tRNS", b"cHRM", b"gAMA", b"iCCP", b"sBIT",
+            b"sRGB", b"bKGD", b"hIST", b"pHYs", b"sPLT", b"acTL", b"fcTL", b"fdAT", b"cICP",
+            b"mDCv", b"cLLi"}
 
 
 def png_chunks(data: bytes):
@@ -671,8 +830,11 @@ def _inflate(blob: bytes, limit=1_000_000) -> bytes:
 
 
 def scan_png(data, where, rep, cfg):
-    for ctype, _s, _e, payload in png_chunks(data):
-        if ctype == b"tEXt":
+    end = None
+    for ctype, _s, cend, payload in png_chunks(data):
+        if ctype == b"IEND":
+            end = cend
+        elif ctype == b"tEXt":
             key, _, val = payload.partition(b"\0")
             _png_text(key, val, where, rep, cfg)
         elif ctype == b"zTXt":
@@ -688,6 +850,15 @@ def scan_png(data, where, rep, cfg):
             report_tiff(parse_tiff(payload), where, rep, cfg)
         elif ctype == b"tIME":
             rep.add("INFO", "photo-metadata", where, "PNG modification time chunk")
+        elif ctype not in PNG_SAFE:
+            rep.add("WARN", "photo-metadata", where,
+                    f"PNG chunk {clean(ctype, 8)!r}: private or unknown data, strip removes it")
+            _terms_in_strings([payload[:MAX_TEXT].decode("latin-1")], where, rep, cfg)
+    if end is None:
+        rep.add("WARN", "photo-metadata", where, "no IEND chunk: truncated PNG")
+    elif end < len(data):
+        rep.add("WARN", "photo-metadata", where,
+                f"{len(data) - end} bytes after the end of the image: strip removes them")
 
 
 def _png_text(key: bytes, val: bytes, where, rep, cfg):
@@ -700,14 +871,45 @@ def _png_text(key: bytes, val: bytes, where, rep, cfg):
     _terms_in_strings([text], where, rep, cfg)
 
 
+PDF_INFO = re.compile(r"/(Author|Creator|Producer|Title|Subject|Keywords)\s*\(([^)]{0,200})\)")
+PDF_INFO_HEX = re.compile(r"/(Author|Creator|Producer|Title|Subject|Keywords)\s*<([0-9A-Fa-f\s]{2,1000})>")
+PDF_STREAM = re.compile(rb"(?<!end)stream\r?\n")
+
+
+def _pdf_hex(value: str) -> str:
+    hexs = re.sub(r"\s", "", value)
+    if len(hexs) % 2:
+        hexs += "0"
+    raw = bytes.fromhex(hexs)
+    if raw.startswith(b"\xfe\xff"):
+        return raw[2:].decode("utf-16-be", "replace")
+    return raw.decode("latin-1")
+
+
 def scan_pdf(data, where, rep, cfg):
     text = data.decode("latin-1")
-    for m in re.finditer(r"/(Author|Creator|Producer|Title|Subject|Keywords)\s*\(([^)]{0,200})\)", text):
-        sev = "INFO" if m.group(1) == "Producer" else "WARN"
-        rep.add(sev, "pdf-metadata", where, f"PDF {m.group(1)}: {clean(m.group(2), 50)!r}")
+    for rx, decode in ((PDF_INFO, lambda v: v), (PDF_INFO_HEX, _pdf_hex)):
+        for m in rx.finditer(text):
+            value = decode(m.group(2))
+            sev = "INFO" if m.group(1) == "Producer" else "WARN"
+            rep.add(sev, "pdf-metadata", where, f"PDF {m.group(1)}: {clean(value, 50)!r}")
+            _terms_in_strings([value], where, rep, cfg)
     if "<x:xmpmeta" in text:
         rep.add("WARN", "pdf-metadata", where, "PDF has an XMP metadata packet")
     _terms_in_strings([text], where, rep, cfg)
+    total = 0
+    for m in PDF_STREAM.finditer(data):
+        stop = data.find(b"endstream", m.end())
+        if stop == -1:
+            break
+        inflated = _inflate(data[m.end():stop], 5_000_000)
+        if not inflated:
+            continue
+        total += len(inflated)
+        if total > 40_000_000:
+            rep.add("WARN", "pdf-metadata", where, "PDF streams only partly scanned (size cap)")
+            break
+        scan_text(inflated.decode("latin-1"), where, rep, cfg, origin="pdf stream", leak_only=True)
 
 
 def scan_video(data, where, rep, cfg):
@@ -719,31 +921,52 @@ def scan_video(data, where, rep, cfg):
             rep.add("WARN", "video-metadata", where, f"video metadata: {label}")
 
 
+OFFICE_EXTS = (".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".pptm", ".odt", ".ods", ".odp")
+PART_CAP = 5_000_000
+DOC_TOTAL_CAP = 40_000_000
+
+
 def scan_zip(data, where, rep, cfg, name):
     import io
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
         infos = zf.infolist()
-    except (zipfile.BadZipFile, OSError, ValueError):
-        rep.add("WARN", "archive", where, "unreadable archive")
+    except Exception:
+        rep.add("FAIL", "archive", where, "unreadable zip-based file: remove it or export it again")
         return
-    office = any(i.filename == "docProps/core.xml" for i in infos) or name.endswith(
-        (".docx", ".xlsx", ".pptx"))
+    names = {i.filename for i in infos}
+    office = "[Content_Types].xml" in names or "mimetype" in names or name.endswith(OFFICE_EXTS)
     if not office:
-        rep.add("WARN", "archive", where,
-                f"archive with {len(infos)} entries: contents are not scanned, ship the files instead")
+        rep.add("FAIL", "archive", where,
+                f"archive with {len(infos)} entries: its contents are not scanned, ship the files instead")
         return
-    for info in infos:
-        if info.filename in ("docProps/core.xml", "docProps/app.xml") and info.file_size <= 1_000_000:
-            try:
-                xml = zf.read(info).decode("utf-8", "replace")
-            except Exception:
-                continue
-            for tag in ("dc:creator", "cp:lastModifiedBy", "Company", "Manager"):
+    total = 0
+    for info in infos[:5000]:
+        if not info.filename.endswith((".xml", ".rels")):
+            continue
+        try:
+            with zf.open(info) as fh:
+                raw = fh.read(PART_CAP + 1)
+        except Exception:
+            rep.add("WARN", "document-metadata", where,
+                    f"could not read part {clean(info.filename, 40)}: check the document by hand")
+            continue
+        if len(raw) > PART_CAP:
+            rep.add("WARN", "document-metadata", where, f"part {clean(info.filename, 40)} only partly scanned")
+            raw = raw[:PART_CAP]
+        total += len(raw)
+        if total > DOC_TOTAL_CAP:
+            rep.add("WARN", "document-metadata", where, "document only partly scanned (size cap)")
+            break
+        xml = raw.decode("utf-8", "replace")
+        part = f"{where} > {clean(info.filename, 60)}"
+        if info.filename in ("docProps/core.xml", "docProps/app.xml", "meta.xml"):
+            for tag in ("dc:creator", "cp:lastModifiedBy", "Company", "Manager", "meta:initial-creator"):
                 m = re.search(rf"<{tag}>([^<]{{1,200}})</{tag}>", xml)
                 if m:
                     rep.add("WARN", "document-metadata", where, f"{tag}: {clean(m.group(1), 50)!r}")
-            _terms_in_strings([xml], where, rep, cfg)
+        scan_text(xml, part, rep, cfg, leak_only=True)
+        scan_text(re.sub(r"<[^<>]{0,4000}>", "", xml), part, rep, cfg, origin="text", full=False)
 
 
 def scan_webp(data, where, rep, cfg):
@@ -760,8 +983,13 @@ def scan_webp(data, where, rep, cfg):
         i += 8 + size + (size & 1)
 
 
+def is_archive(data: bytes) -> bool:
+    return (data[:2] == b"\x1f\x8b" or data[:3] == b"BZh" or data[:6] == b"\xfd7zXZ\x00"
+            or data[:6] == b"7z\xbc\xaf\x27\x1c" or data[:4] == b"Rar!" or data[257:262] == b"ustar")
+
+
 def scan_media(name: str, data: bytes, where: str, rep: Report, cfg) -> bool:
-    """Returns True when the bytes were recognised as a media / document format."""
+    """Returns True when the magic bytes match a media, document or archive format."""
     low = name.lower()
     if data[:2] == b"\xff\xd8":
         scan_jpeg(data, where, rep, cfg)
@@ -784,6 +1012,8 @@ def scan_media(name: str, data: bytes, where: str, rep: Report, cfg) -> bool:
         report_tiff(parse_tiff(data), where, rep, cfg)
     elif data[:4] == b"PK\x03\x04":
         scan_zip(data, where, rep, cfg, low)
+    elif is_archive(data):
+        rep.add("FAIL", "archive", where, "compressed archive: its contents are not scanned, ship the files instead")
     else:
         return False
     return True
@@ -792,59 +1022,114 @@ def scan_media(name: str, data: bytes, where: str, rep: Report, cfg) -> bool:
 # ------------------------------------------------------------ file checks
 
 SENSITIVE_FAIL = [
-    ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_dsa*", "id_ecdsa*",
-    "id_ed25519*", "*.keystore", "*.jks", "credentials.json", "client_secret*.json",
+    ".env", ".env.*", "*.env", ".envrc", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_dsa*",
+    "id_ecdsa*", "id_ed25519*", "*.keystore", "*.jks", "credentials.json", "client_secret*.json",
     "service-account*.json", "secrets.json", "secrets.yaml", "secrets.yml", "secrets.toml",
     ".npmrc", ".pypirc", ".netrc", ".git-credentials", "*.kdbx", "token.json", "*.ovpn",
     "*.mobileprovision", "settings.local.json",
 ]
 SENSITIVE_OK = [".env.example", ".env.sample", ".env.template", ".env.dist"]
 JUNK_WARN = [
-    ".DS_Store", "Thumbs.db", "*.pyc", "*.pyo", "*.log", "*.sqlite", "*.sqlite3", "*.db",
+    ".ds_store", "thumbs.db", "*.pyc", "*.pyo", "*.log", "*.sqlite", "*.sqlite3", "*.db",
     "*.jsonl", "*.swp", "*.bak", "*.orig", "*.tmp", "*.heic", "arduino_secrets.h",
 ]
 JUNK_DIRS = {"__pycache__", "node_modules", ".venv", "venv", ".idea", ".vscode", ".pytest_cache",
              ".mypy_cache", ".claude", ".ipynb_checkpoints", "dist", "build"}
-MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".pdf", ".mp4", ".mov", ".m4v", ".m4a", ".heic", ".heif",
-              ".gif", ".webp", ".tif", ".tiff", ".docx", ".xlsx", ".pptx", ".odt", ".ods",
-              ".odp", ".zip", ".avif"}
+AGENT_CONFIG = re.compile(r"(?:^|/)(?:\.claude/settings(?:\.local)?\.json|hooks/hooks\.json|\.mcp\.json)$",
+                          re.I)
+BAD_NAME_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
-AGENT_CONFIG = re.compile(r"(?:^|/)(?:\.claude/settings(?:\.local)?\.json|hooks/hooks\.json|\.mcp\.json)$")
-
-
-def check_name(rel: str, rep: Report, where: str):
+def check_name(rel: str, rep: Report, where: str, cfg=None):
     base = rel.rsplit("/", 1)[-1]
+    low = base.lower()
     parts = rel.split("/")[:-1]
+    shown = clean(where, 200)
+    if BAD_NAME_CHARS.search(rel) or any(sev != "BOM" for _p, _c, sev in hidden_chars(rel)):
+        rep.add("FAIL", "bad-filename", shown, "file name with control or invisible characters: rename it")
+    rx = cfg.get("_terms_re") if cfg else None
+    if rx:
+        m = rx.search(rel)
+        if m:
+            rep.add("FAIL", "private-term", shown, f"private term {clean(m.group(0), 40)!r} in the file name")
     if AGENT_CONFIG.search(rel):
-        rep.add("FAIL", "agent-config", where,
+        rep.add("FAIL", "agent-config", shown,
                 "Claude Code settings, hooks or MCP config: they grant permissions or run "
                 "commands on every user's machine; a skill does not ship them")
-    elif base not in SENSITIVE_OK and any(fnmatch.fnmatch(base, p) for p in SENSITIVE_FAIL):
-        rep.add("FAIL", "sensitive-file", where, f"file type that usually holds secrets: {base}")
-    elif any(fnmatch.fnmatch(base, p) for p in JUNK_WARN):
-        rep.add("WARN", "junk-file", where, f"should not be published: {base}")
+    elif low not in SENSITIVE_OK and any(fnmatch.fnmatchcase(low, p) for p in SENSITIVE_FAIL):
+        rep.add("FAIL", "sensitive-file", shown, f"file type that usually holds secrets: {clean(base, 60)}")
+    elif any(fnmatch.fnmatchcase(low, p) for p in JUNK_WARN):
+        rep.add("WARN", "junk-file", shown, f"should not be published: {clean(base, 60)}")
+    if low.startswith(".gitleaks"):
+        rep.add("WARN", "gitleaks-config", shown,
+                "gitleaks configuration in the repo: this scan ignores it, but it silences gitleaks elsewhere")
     bad_dirs = [p for p in parts if p in JUNK_DIRS]
     if bad_dirs:
-        rep.add("WARN", "junk-dir", where, f"inside {bad_dirs[0]}/: add it to .gitignore")
+        rep.add("WARN", "junk-dir", shown, f"inside {clean(bad_dirs[0], 30)}/: add it to .gitignore")
 
 
 def git_blob_sha(data: bytes) -> str:
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
+def decode_text(data: bytes):
+    """(text, encoding) for UTF-8, UTF-16 and UTF-32 text with or without a BOM; (None, "") for binary."""
+    for bom, enc in ((codecs.BOM_UTF32_LE, "utf-32-le"), (codecs.BOM_UTF32_BE, "utf-32-be"),
+                     (codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF16_BE, "utf-16-be")):
+        if data.startswith(bom):
+            return data[len(bom):].decode(enc, "replace"), enc
+    sample = data[:8192]
+    nul = sample.count(0)
+    if nul == 0:
+        text = data.decode("utf-8", "replace")
+        return (text, "utf-8") if looks_text(text[:8192]) else (None, "")
+    half = max(1, len(sample) // 2)
+    even, odd = sample[0::2].count(0), sample[1::2].count(0)
+    if odd > 0.3 * half and even < 0.05 * half:
+        return data.decode("utf-16-le", "replace"), "utf-16-le"
+    if even > 0.3 * half and odd < 0.05 * half:
+        return data.decode("utf-16-be", "replace"), "utf-16-be"
+    if nul <= max(2, len(sample) // 100):
+        text = data.decode("utf-8", "replace").replace("\0", "")
+        if looks_text(text[:8192]):
+            return text, "utf-8 with NUL bytes"
+    return None, ""
+
+
+def looks_text(sample: str) -> bool:
+    """False when more than 2% of the sample is undecodable bytes or control characters."""
+    if not sample:
+        return True
+    bad = sample.count("\ufffd") + sum(1 for ch in sample if ord(ch) < 32 and ch not in "\t\n\r\f")
+    return bad <= len(sample) * 0.02
+
+
 def is_binary(data: bytes) -> bool:
-    return b"\0" in data[:8192]
+    return decode_text(data[:8192])[0] is None
+
+
+TEXT_EXT = CODE_EXT | {".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+                       ".csv", ".tsv", ".xml", ".svg", ".css", ".rst", ".env", ".envrc", ".properties",
+                       ".jsonl", ".ipynb", ""}
 
 
 def scan_bytes(rel: str, data: bytes, rep: Report, cfg, origin: str = "", full: bool = True):
     where = f"{rel} ({origin})" if origin else rel
     ext = os.path.splitext(rel.lower())[1]
-    if ext in MEDIA_EXTS or is_binary(data):
-        if not scan_media(rel, data[:MAX_MEDIA], where, rep, cfg) and is_binary(data) and full:
-            rep.add("INFO", "binary-file", where, "binary file of unknown type: check it by hand")
+    recognised = scan_media(rel, data[:MAX_MEDIA], where, rep, cfg)
+    text, enc = decode_text(data[:MAX_TEXT])
+    if text is None and not recognised and ext in TEXT_EXT:
+        # A text file full of control characters is still read as text.
+        text, enc = data[:MAX_TEXT].decode("utf-8", "replace").replace("\0", ""), "utf-8 with control characters"
+    if text is None:
+        if not recognised and full:
+            rep.add("WARN", "binary-file", where,
+                    "binary file of unknown type: only searched for secrets and private terms, check it by hand")
+        scan_text(data[:MAX_TEXT].decode("latin-1"), rel, rep, cfg, origin=origin, leak_only=True,
+                  binary=True)
         return
-    text = data[:MAX_TEXT].decode("utf-8", "replace")
+    if enc != "utf-8" and full:
+        rep.add("WARN", "encoding", where, f"{enc} text: scanned here, but other tools may miss it")
     if len(data) > MAX_TEXT:
         rep.add("WARN", "large-text", where, f"only the first {MAX_TEXT} bytes were scanned")
     scan_text(text, rel, rep, cfg, ext=ext, origin=origin, full=full)
@@ -853,17 +1138,88 @@ def scan_bytes(rel: str, data: bytes, rep: Report, cfg, origin: str = "", full: 
             rep.add("WARN", "svg-metadata", where, "SVG <metadata> block: check or remove it")
         if re.search(r"sodipodi:docname|inkscape:export-filename", text):
             rep.add("WARN", "svg-metadata", where, "Inkscape file or export names: remove them")
-        if re.search(r"<script\b|\son[a-z]+\s*=", text, re.I):
+        if re.search(r"<script\b|\son[a-z]{1,30}\s*=", text, re.I):
             rep.add("WARN", "svg-active", where, "SVG with script or event handlers")
+
+
+def read_regular(path: Path, limit: int = MAX_TEXT):
+    """Bytes of a regular file, never through a symlink, never blocking on a FIFO; None otherwise."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks, left = [], limit
+        while left > 0:
+            chunk = os.read(fd, min(left, 1 << 20))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            left -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def read_text_regular(path: Path, limit: int = MAX_TEXT):
+    data = read_regular(path, limit)
+    return None if data is None else data.decode("utf-8", "replace")
 
 
 # ------------------------------------------------------------------- git
 
+SAFE_GIT_KEY = re.compile(
+    r"core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode"
+    r"|symlinks|autocrlf|safecrlf|eol|quotepath)"
+    r"|remote\.[^\n]{1,200}\.(?:url|fetch|pushurl|tagopt|prune)"
+    r"|branch\.[^\n]{1,200}\.(?:remote|merge|rebase|pushremote)"
+    r"|user\.(?:name|email)|init\.defaultbranch|http\.postbuffer|pull\.rebase|push\.default"
+    r"|extensions\.objectformat", re.I)
+
+
+def git_env():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_CONFIG_NOSYSTEM="1")
+    return env
+
+
 def git(root: Path, *args, input_bytes=None, timeout=180) -> subprocess.CompletedProcess:
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
     return subprocess.run(
-        ["git", "-c", "core.fsmonitor=false", "-c", "core.quotepath=off", "-C", str(root), *args],
-        input=input_bytes, capture_output=True, timeout=timeout, env=env)
+        ["git", "-c", "core.fsmonitor=false", "-c", "core.quotepath=off", "-c", "log.showSignature=false",
+         "-C", str(root), *args],
+        input=input_bytes, capture_output=True, timeout=timeout, env=git_env())
+
+
+def git_config_problem(root: Path):
+    """Why git must not run in this folder, or None. Only plain, known config keys are accepted."""
+    gd = root / ".git"
+    try:
+        st = os.lstat(gd)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode):
+        return ".git is a file or a link (worktree, submodule or pointer)"
+    for extra in ("config.worktree", "commondir"):
+        if os.path.lexists(gd / extra):
+            return f".git/{extra} is present"
+    cfgf = gd / "config"
+    if not os.path.lexists(cfgf):
+        return None
+    if not stat.S_ISREG(os.lstat(cfgf).st_mode):
+        return ".git/config is not a regular file"
+    res = subprocess.run(["git", "config", "--file", str(cfgf), "--no-includes", "--list", "--null"],
+                         capture_output=True, timeout=30, cwd=tempfile.gettempdir(), env=git_env())
+    if res.returncode != 0:
+        return ".git/config cannot be read"
+    for entry in res.stdout.split(b"\0"):
+        if entry:
+            key = entry.split(b"\n", 1)[0].decode("utf-8", "replace")
+            if not SAFE_GIT_KEY.fullmatch(key):
+                return f"it sets {clean(key, 60)}"
+    return None
 
 
 def git_root(root: Path):
@@ -873,6 +1229,26 @@ def git_root(root: Path):
     if r.returncode != 0:
         return None
     return Path(r.stdout.decode().strip()).resolve()
+
+
+def cat_file_batch(root: Path, shas, timeout=600):
+    """Yields (sha, type, content) for each object, read with one `git cat-file --batch`."""
+    if not shas:
+        return
+    out = git(root, "cat-file", "--batch", input_bytes=("\n".join(shas) + "\n").encode(),
+              timeout=timeout).stdout
+    i = 0
+    while i < len(out):
+        nl = out.find(b"\n", i)
+        if nl == -1:
+            return
+        header = out[i:nl].split()
+        if len(header) != 3:
+            i = nl + 1
+            continue
+        sha, typ, size = header[0].decode(), header[1].decode(), int(header[2])
+        yield sha, typ, out[nl + 1:nl + 1 + size]
+        i = nl + 1 + size + 1
 
 
 def list_files(root: Path, use_git: bool, rep: Report):
@@ -917,28 +1293,33 @@ def scan_tree(root: Path, use_git: bool, rep: Report, cfg) -> set:
             st = os.lstat(full)
         except OSError:
             continue
-        check_name(rel, rep, where)
+        check_name(rel, rep, where, cfg)
         if stat.S_ISLNK(st.st_mode):
             target = os.readlink(full)
             resolved = (full.parent / target).resolve()
             try:
                 resolved.relative_to(root.resolve())
-                rep.add("WARN", "symlink", where, f"symlink to {clean(target, 60)} (inside the repo)")
+                rep.add("WARN", "symlink", clean(where, 200), f"symlink to {clean(target, 60)} (inside the repo)")
             except ValueError:
-                rep.add("FAIL", "symlink", where,
+                rep.add("FAIL", "symlink", clean(where, 200),
                         f"symlink points outside the repo: {clean(target, 60)}")
             continue
         if not stat.S_ISREG(st.st_mode):
+            rep.add("WARN", "special-file", clean(where, 200), "not a regular file (FIFO, socket or device)")
             continue
         if st.st_size > FAIL_SIZE:
             rep.add("FAIL", "large-file", where, f"{st.st_size // 1_000_000} MB: too big for a skill repo")
         elif st.st_size > WARN_SIZE:
             rep.add("WARN", "large-file", where, f"{st.st_size // 1_000_000} MB: is it needed?")
-        with open(full, "rb") as fh:
-            data = fh.read(MAX_MEDIA)
+        data = read_regular(full, MAX_MEDIA)
+        if data is None:
+            continue
         if st.st_size <= MAX_MEDIA:
             shas.add(git_blob_sha(data))
-        scan_bytes(rel, data, rep, cfg, origin="untracked" if untracked else "")
+        try:
+            scan_bytes(rel, data, rep, cfg, origin="untracked" if untracked else "")
+        except Exception as exc:  # fail closed: an unscannable file is a finding
+            rep.add("FAIL", "scanner-error", where, f"could not scan this file ({type(exc).__name__}): check it by hand")
     return shas
 
 
@@ -964,7 +1345,7 @@ def scan_history(root: Path, rep: Report, cfg, current_shas: set):
         if sha in current_shas:
             continue
         rel = paths[sha]
-        check_name(rel, rep, f"{rel} (history {sha[:7]})")
+        check_name(rel, rep, f"{rel} (history {sha[:7]})", cfg)
         if size > MAX_MEDIA or total + size > MAX_HISTORY_TOTAL:
             skipped += 1
             continue
@@ -972,28 +1353,17 @@ def scan_history(root: Path, rep: Report, cfg, current_shas: set):
         wanted.append(sha)
     if skipped:
         rep.add("WARN", "history-partial", ".", f"{skipped} large blobs in the history were not scanned")
-    if not wanted:
-        return
-    batch = git(root, "cat-file", "--batch", input_bytes=("\n".join(wanted) + "\n").encode(),
-                timeout=600)
-    out = batch.stdout
     hist = Report()
     hist.CAP = 10 ** 9
-    i = 0
-    while i < len(out):
-        nl = out.find(b"\n", i)
-        if nl == -1:
-            break
-        header = out[i:nl].split()
-        if len(header) != 3:
-            break
-        sha, size = header[0].decode(), int(header[2])
-        data = out[nl + 1:nl + 1 + size]
-        i = nl + 1 + size + 1
+    for sha, typ, data in cat_file_batch(root, wanted):
         rel = paths.get(sha, sha)
-        scan_bytes(rel, data, hist, cfg, full=False,
-                   origin=f"history {sha[:7]}, find it with git log --all --find-object={sha[:12]}")
-    # The same leak repeated in every old version of a file is reported once.
+        origin = f"history {sha[:7]}, find it with git log --all --find-object={sha[:12]}"
+        try:
+            scan_bytes(rel, data, hist, cfg, full=False, origin=origin)
+        except Exception as exc:
+            hist.add("FAIL", "scanner-error", f"{rel} ({origin})", f"could not scan ({type(exc).__name__})")
+    # The same leak repeated in every old version of a file is reported once
+    # (different secrets differ in their masked fingerprint).
     seen = set()
     for f in hist.findings:
         key = (f.severity, f.check, f.path.split(" (", 1)[0], f.message)
@@ -1002,27 +1372,55 @@ def scan_history(root: Path, rep: Report, cfg, current_shas: set):
             rep.add(f.severity, f.check, f.path, f.message, f.line)
 
 
+IDENT = re.compile(rb"^(.*) <(.*)> -?\d+ [+-]\d{4}$")
+
+
+def parse_commit(raw: bytes):
+    """(author, committer, message) from a raw commit object; identities are None if unreadable."""
+    head, _sep, msg = raw.partition(b"\n\n")
+    author = committer = None
+    for line in head.split(b"\n"):
+        if line.startswith(b" "):
+            continue
+        for prefix in (b"author ", b"committer "):
+            if line.startswith(prefix):
+                m = IDENT.match(line[len(prefix):])
+                ident = None
+                if m:
+                    ident = f"{m.group(1).decode('utf-8', 'replace')} <{m.group(2).decode('utf-8', 'replace')}>"
+                if prefix == b"author ":
+                    author = ident
+                else:
+                    committer = ident
+    return author, committer, msg.decode("utf-8", "replace")
+
+
 def scan_commits(root: Path, rep: Report, cfg):
-    r = git(root, "log", "--all", "--format=%H%x1f%an <%ae>%x1f%cn <%ce>%x1f%B%x1e")
+    r = git(root, "rev-list", "--all")
     if r.returncode != 0:
         return
+    shas = r.stdout.decode().split()
     identities: dict = {}
     trailers = set()
-    for rec in r.stdout.decode("utf-8", "replace").split("\x1e"):
-        rec = rec.strip("\n")
-        if not rec:
+    for sha, typ, raw in cat_file_batch(root, shas):
+        if typ != "commit":
             continue
-        parts = rec.split("\x1f")
-        if len(parts) != 4:
-            continue
-        sha, author, committer, body = parts
+        author, committer, body = parse_commit(raw)
+        if author is None or committer is None:
+            rep.add("FAIL", "commit-identity", "git", f"commit {sha[:7]}: author or committer cannot be read")
         for ident in (author, committer):
-            identities[ident] = identities.get(ident, 0) + 1
-        for t in re.findall(r"(?im)^co-authored-by:\s*(.+)$", body):
+            if ident:
+                identities[ident] = identities.get(ident, 0) + 1
+        for t in re.findall(r"(?im)^co-authored-by:[ \t]*(.+)$", body):
             trailers.add(t.strip())
         scan_text(body, f"commit {sha[:7]}", rep, cfg, origin="message", full=False)
     allowed = set(cfg["author_identities"])
+    rx = cfg.get("_terms_re")
     for ident, n in sorted(identities.items()):
+        if rx and ident not in allowed and rx.search(ident):
+            rep.add("FAIL", "private-term", "git", f"a commit identity contains a private term ({n})")
+        if BAD_NAME_CHARS.search(ident) or any(sev != "BOM" for _p, _c, sev in hidden_chars(ident)):
+            rep.add("FAIL", "commit-identity", "git", "commit identity with control or invisible characters")
         if PLATFORM_IDENTITY.match(ident):
             rep.add("INFO", "commit-identity", "git", f"platform identity (merges, bots): {clean(ident, 70)} ({n})")
         elif allowed and ident not in allowed:
@@ -1040,34 +1438,49 @@ def scan_commits(root: Path, rep: Report, cfg):
 
 # ---------------------------------------------------------------- gitleaks
 
+GITLEAKS_DEFAULT_CONFIG = "[extend]\nuseDefault = true\n"
+
+
 def run_gitleaks(root: Path, use_git: bool, rep: Report, files):
-    """gitleaks on a copy of exactly the files a publish would include, plus the history."""
+    """gitleaks with its default rules only, on a copy of exactly the files a publish
+    would include, plus the history. Repo-level gitleaks config and allow comments
+    are ignored, so the scanned repo cannot silence it."""
     exe = shutil.which("gitleaks")
     if not exe:
-        rep.add("WARN", "gitleaks", ".", "gitleaks is not installed: install it and re-run, the built-in rules are a subset")
+        rep.add("FAIL", "gitleaks", ".", "gitleaks is not installed: install it, or pass --no-gitleaks "
+                "and say in the release report that it was skipped")
         return
     with tempfile.TemporaryDirectory() as td:
         copy = Path(td) / "tree"
+        copy.mkdir()
         for rel, _u in files:
-            src = root / rel
-            if src.is_symlink() or not src.is_file():
+            if rel.rsplit("/", 1)[-1].lower().startswith(".gitleaks"):
+                continue
+            data = read_regular(root / rel, MAX_MEDIA)
+            if data is None:
                 continue
             dest = copy / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, dest)
-        copy.mkdir(exist_ok=True)
+            dest.write_bytes(data)
+        conf = Path(td) / "gitleaks.toml"
+        conf.write_text(GITLEAKS_DEFAULT_CONFIG, encoding="utf-8")
+        ignore_dir = Path(td) / "no-ignore"
+        ignore_dir.mkdir()
         modes = [("dir", ["dir", str(copy)], ["detect", "--no-git", "--source", str(copy)])]
         if use_git:
             modes.append(("git", ["git", str(root)], ["detect", "--source", str(root)]))
         for label, new, legacy in modes:
             report = os.path.join(td, f"{label}.json")
             common = ["--no-banner", "--redact", "--report-format", "json", "--report-path", report,
-                      "--exit-code", "0"]
-            res = subprocess.run([exe, *new, *common], capture_output=True, timeout=900)
+                      "--exit-code", "0", "--config", str(conf), "--gitleaks-ignore-path", str(ignore_dir),
+                      "--ignore-gitleaks-allow"]
+            res = subprocess.run([exe, *new, *common], capture_output=True, timeout=900,
+                                 env=git_env(), cwd=td)
             if res.returncode != 0 and b"unknown command" in res.stderr.lower():
-                res = subprocess.run([exe, *legacy, *common], capture_output=True, timeout=900)
+                res = subprocess.run([exe, *legacy, *common], capture_output=True, timeout=900,
+                                     env=git_env(), cwd=td)
             if res.returncode != 0:
-                rep.add("WARN", "gitleaks", ".", f"gitleaks {label} failed: {clean(res.stderr[-200:], 120)}")
+                rep.add("FAIL", "gitleaks", ".", f"gitleaks {label} failed: {clean(res.stderr[-200:], 120)}")
                 continue
             try:
                 with open(report, encoding="utf-8") as fh:
@@ -1081,15 +1494,15 @@ def run_gitleaks(root: Path, use_git: bool, rep: Report, files):
                     file = os.path.relpath(file, base) if os.path.isabs(file) else file
                 except ValueError:
                     pass
-                commit = f" commit {str(f.get('Commit'))[:7]}" if f.get("Commit") else ""
-                rep.add("FAIL", f"gitleaks-{label}", file.replace(os.sep, "/"),
+                commit = f" commit {clean(f.get('Commit'), 7)}" if f.get("Commit") else ""
+                rep.add("FAIL", f"gitleaks-{label}", clean(file.replace(os.sep, "/"), 200),
                         f"{clean(f.get('RuleID', 'secret'), 40)}{commit}", int(f.get("StartLine") or 0))
 
 
 # --------------------------------------------------------- skill and repo
 
-FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*(?:\n|\Z)", re.S)
-LINK = re.compile(r"\[[^\]\n]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+FRONTMATTER = re.compile(r"\A---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)", re.S)
+LINK = re.compile(r"\[[^\]\n]{0,300}\]\(([^)\s]{1,500})(?:[ \t]+\"[^\"\n]{0,300}\")?\)")
 
 
 def parse_frontmatter(text: str):
@@ -1098,7 +1511,7 @@ def parse_frontmatter(text: str):
         return None, text
     fields, key, block = {}, None, []
     for line in m.group(1).splitlines():
-        km = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)$", line)
+        km = re.match(r"^([A-Za-z0-9_-]{1,64}):[ \t]*(.*)$", line)
         if km and not line.startswith((" ", "\t")):
             if key and block:
                 fields[key] = " ".join(s.strip() for s in block).strip()
@@ -1107,7 +1520,8 @@ def parse_frontmatter(text: str):
                 fields[key] = ""
             else:
                 fields[key] = val.strip("\"'") if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'" else val
-                key = None
+                if val:
+                    key = None
         elif key:
             block.append(line)
     if key and block:
@@ -1116,11 +1530,10 @@ def parse_frontmatter(text: str):
 
 
 def check_skill(root: Path, rep: Report, cfg):
-    sk = root / "SKILL.md"
-    if not sk.is_file() or sk.is_symlink():
-        rep.add("FAIL", "skill-md", "SKILL.md", "missing: this is not a skill folder")
+    text = read_text_regular(root / "SKILL.md")
+    if text is None:
+        rep.add("FAIL", "skill-md", "SKILL.md", "missing (or not a regular file): this is not a skill folder")
         return
-    text = sk.read_text(encoding="utf-8", errors="replace")
     fields, body = parse_frontmatter(text)
     if fields is None:
         rep.add("FAIL", "skill-md", "SKILL.md", "no YAML frontmatter (--- name / description ---)")
@@ -1149,7 +1562,7 @@ def check_skill(root: Path, rep: Report, cfg):
     if n_lines > 500:
         rep.add("WARN", "skill-md", "SKILL.md", f"body is {n_lines} lines: move detail into references/")
     if cfg.get("require_intake"):
-        heads = re.findall(r"(?m)^#{2,3}\s+(.+)$", body)
+        heads = re.findall(r"(?m)^#{2,3}[ \t]+(.+)$", body)
         first = " ".join(heads[:4]).lower()
         if not re.search(r"intake|question|interview|domande|ask", first):
             rep.add("WARN", "skill-intake", "SKILL.md", "no intake step among the first headings: the skill should start by asking")
@@ -1161,9 +1574,9 @@ def check_links(root: Path, rep: Report, files):
         if not rel.endswith(".md") or rel.startswith("templates/"):
             continue
         full = root / rel
-        if full.is_symlink() or not full.is_file():
+        text = read_text_regular(full)
+        if text is None:
             continue
-        text = full.read_text(encoding="utf-8", errors="replace")[:MAX_TEXT]
         for m in LINK.finditer(text):
             target = m.group(1)
             if re.match(r"^(?:[a-z][a-z0-9+.-]*:|#|//)", target, re.I):
@@ -1175,48 +1588,46 @@ def check_links(root: Path, rep: Report, files):
             try:
                 dest.relative_to(root.resolve())
             except ValueError:
-                rep.add("WARN", "link", rel, f"link leaves the repo: {clean(target, 60)}", line_of(text, m.start()))
+                rep.add("WARN", "link", clean(rel, 200), f"link leaves the repo: {clean(target, 60)}", line_of(text, m.start()))
                 continue
             if not dest.exists():
-                rep.add("WARN", "link", rel, f"broken relative link: {clean(target, 60)}", line_of(text, m.start()))
+                rep.add("WARN", "link", clean(rel, 200), f"broken relative link: {clean(target, 60)}", line_of(text, m.start()))
 
 
 def check_repo_files(root: Path, rep: Report, cfg, files):
     names = {rel for rel, _ in files}
     for doc in sorted(n for n in names if "/" not in n and re.match(
             r"^(?:README|SECURITY|SKILL|LICEN[CS]E|CONTRIBUTING)(?:\.md|\.txt)?$", n)):
-        full = root / doc
-        if full.is_symlink() or not full.is_file():
+        text = read_text_regular(root / doc)
+        if text is None:
             continue
-        text = full.read_text(encoding="utf-8", errors="replace")[:MAX_TEXT]
         for m in PLACEHOLDER_LEFT.finditer(text):
             rep.add("FAIL", "placeholder", doc, f"template placeholder left: {m.group(0)}",
                     line_of(text, m.start()))
     lic = next((n for n in ("LICENSE", "LICENSE.md", "LICENSE.txt", "LICENCE") if n in names), None)
-    if not lic:
-        rep.add("FAIL", "license", ".", "no LICENSE file")
+    lic_text = read_text_regular(root / lic) if lic else None
+    if lic_text is None:
+        rep.add("FAIL", "license", ".", "no LICENSE file (or it is not a regular file)")
     else:
-        text = (root / lic).read_text(encoding="utf-8", errors="replace")
-        if "Permission is hereby granted, free of charge" not in text and "MIT License" not in text:
+        if "Permission is hereby granted, free of charge" not in lic_text and "MIT License" not in lic_text:
             rep.add("INFO", "license", lic, "not the MIT text: make sure the licence is the one agreed")
         holder = cfg.get("copyright_holder")
-        if holder and holder not in text:
+        if holder and holder not in lic_text:
             rep.add("WARN", "license", lic, f"copyright holder {holder!r} not found")
-    if "README.md" not in names:
-        rep.add("FAIL", "readme", ".", "no README.md")
+    readme = read_text_regular(root / "README.md") if "README.md" in names else None
+    if readme is None:
+        rep.add("FAIL", "readme", ".", "no README.md (or it is not a regular file)")
     else:
-        heads = " ".join(re.findall(r"(?m)^#{1,3}\s+(.+)$",
-                                    (root / "README.md").read_text(encoding="utf-8", errors="replace"))).lower()
+        heads = " ".join(re.findall(r"(?m)^#{1,3}[ \t]+(.+)$", readme)).lower()
         for want, rx in (("Install", r"install"), ("Usage", r"usage|how to use|use it"),
                          ("Security", r"security"), ("Licence", r"licen[cs]e")):
             if not re.search(rx, heads):
                 rep.add("WARN", "readme", "README.md", f"no {want} section")
-    if "SECURITY.md" not in names:
+    sec = read_text_regular(root / "SECURITY.md") if "SECURITY.md" in names else None
+    if sec is None:
         rep.add("WARN", "security-md", ".", "no SECURITY.md (threat model and how to report)")
-    else:
-        st = (root / "SECURITY.md").read_text(encoding="utf-8", errors="replace").lower()
-        if "report a vulnerability" not in st and "private vulnerability reporting" not in st:
-            rep.add("WARN", "security-md", "SECURITY.md", "does not say how to report privately")
+    elif "report a vulnerability" not in sec.lower() and "private vulnerability reporting" not in sec.lower():
+        rep.add("WARN", "security-md", "SECURITY.md", "does not say how to report privately")
     if ".gitignore" not in names:
         rep.add("WARN", "gitignore", ".", "no .gitignore")
     if ".gitmodules" in names:
@@ -1224,24 +1635,31 @@ def check_repo_files(root: Path, rep: Report, cfg, files):
     workflows = [n for n in names if re.match(r"^\.github/workflows/[^/]+\.ya?ml$", n)]
     if not workflows:
         rep.add("WARN", "ci", ".", "no CI workflow in .github/workflows")
-    for wf in workflows:
+    for wf in sorted(workflows):
         check_workflow(root, wf, rep)
-    for req in [n for n in names if re.match(r"^(?:.*/)?requirements[^/]*\.txt$", n)]:
-        for i, line in enumerate((root / req).read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+    for req in sorted(n for n in names if re.match(r"^(?:.*/)?requirements[^/]*\.txt$", n)):
+        text = read_text_regular(root / req)
+        if text is None:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
             s = line.split("#", 1)[0].strip()
             if s and not s.startswith("-") and "==" not in s and " @ " not in s:
-                rep.add("WARN", "unpinned-dependency", req, f"not pinned with ==: {clean(s, 50)}", i)
-    for pkg in [n for n in names if n.endswith("package.json") and "node_modules/" not in n]:
+                rep.add("WARN", "unpinned-dependency", clean(req, 200), f"not pinned with ==: {clean(s, 50)}", i)
+    for pkg in sorted(n for n in names if n.endswith("package.json") and "node_modules/" not in n):
         folder = pkg[: -len("package.json")]
         if not any(folder + lock in names for lock in ("package-lock.json", "pnpm-lock.yaml", "yarn.lock")):
-            rep.add("WARN", "unpinned-dependency", pkg, "no lockfile next to package.json")
+            rep.add("WARN", "unpinned-dependency", clean(pkg, 200), "no lockfile next to package.json")
 
 
-USES = re.compile(r"(?m)^\s*-?\s*uses:\s*['\"]?([^\s'\"#]+)")
+USES = re.compile(r"(?m)^[ \t]*-?[ \t]*uses:[ \t]*['\"]?([^\s'\"#]{1,300})")
 
 
 def check_workflow(root: Path, wf: str, rep: Report):
-    text = (root / wf).read_text(encoding="utf-8", errors="replace")
+    text = read_text_regular(root / wf, 1_000_000)
+    if text is None:
+        rep.add("WARN", "ci", clean(wf, 200), "workflow is not a regular file")
+        return
+    wf = clean(wf, 200)
     n_checkout = 0
     for m in USES.finditer(text):
         ref = m.group(1)
@@ -1252,11 +1670,11 @@ def check_workflow(root: Path, wf: str, rep: Report):
         if not re.search(r"@[0-9a-f]{40}$", ref):
             rep.add("FAIL", "ci-unpinned", wf, f"action not pinned to a commit SHA: {clean(ref, 60)}",
                     line_of(text, m.start()))
-    if re.search(r"(?m)^\s*pull_request_target\s*:|\bpull_request_target\b", text):
+    if re.search(r"\bpull_request_target\b", text):
         rep.add("FAIL", "ci-trigger", wf, "pull_request_target runs fork code with secrets")
-    if not re.search(r"(?m)^permissions\s*:", text):
+    if not re.search(r"(?m)^permissions[ \t]*:", text):
         rep.add("WARN", "ci-permissions", wf, "no top-level permissions (use contents: read)")
-    if re.search(r"permissions\s*:\s*write-all", text):
+    if re.search(r"permissions[ \t]*:[ \t]*write-all", text):
         rep.add("FAIL", "ci-permissions", wf, "permissions: write-all")
     if "${{ secrets." in text.replace("${{secrets.", "${{ secrets."):
         rep.add("WARN", "ci-secrets", wf, "uses repository secrets: a skill CI should not need any")
@@ -1269,30 +1687,45 @@ def check_workflow(root: Path, wf: str, rep: Report):
 def scan(root: Path, cfg, *, history=True, gitleaks=True) -> Report:
     rep = Report()
     root = root.resolve()
-    top = git_root(root)
+    problem = git_config_problem(root) if os.path.lexists(root / ".git") else None
+    if problem:
+        rep.add("FAIL", "unsafe-git", ".",
+                f"git is not run in this folder ({problem}): scan a fresh `git clone --no-local` copy "
+                "or stage the files again; history not scanned")
+        top = None
+    else:
+        top = git_root(root)
     use_git = top is not None and top == root
     if top is not None and top != root:
         rep.add("WARN", "git", ".", f"folder is inside another repo ({clean(top, 60)}): history not scanned; stage it in its own folder")
-    elif top is None:
+    elif top is None and not problem:
         rep.add("INFO", "git", ".", "not a git repo yet: history checks skipped")
     n_terms = len(cfg["_terms"])
     if cfg.get("_source"):
-        rep.add("INFO", "config", ".", f"owner config {cfg['_source']}, {n_terms} private terms")
+        rep.add("INFO", "config", ".", f"owner config {clean(cfg['_source'], 120)}, {n_terms} private terms")
     else:
         rep.add("WARN", "config", ".", "no owner config.json: commit identities are not checked")
     if not n_terms:
         rep.add("WARN", "config", ".", "no private terms loaded: names of people, clients and "
                 "private projects are not checked (see README, private settings)")
     files = list_files(root, use_git, Report())
-    shas = scan_tree(root, use_git, rep, cfg)
-    check_skill(root, rep, cfg)
-    check_repo_files(root, rep, cfg, files)
-    check_links(root, rep, files)
-    if use_git and history:
-        scan_history(root, rep, cfg, shas)
-        scan_commits(root, rep, cfg)
-    if gitleaks:
-        run_gitleaks(root, use_git, rep, files)
+    shas: set = set()
+    try:
+        shas = scan_tree(root, use_git, rep, cfg)
+    except Exception as exc:
+        rep.add("FAIL", "scanner-error", ".", f"file scan stopped ({type(exc).__name__}): fix and re-run")
+    for label, fn in (("SKILL.md", lambda: check_skill(root, rep, cfg)),
+                      ("repo files", lambda: check_repo_files(root, rep, cfg, files)),
+                      ("links", lambda: check_links(root, rep, files)),
+                      ("history", lambda: scan_history(root, rep, cfg, shas) if use_git and history else None),
+                      ("commits", lambda: scan_commits(root, rep, cfg) if use_git and history else None),
+                      ("gitleaks", lambda: run_gitleaks(root, use_git, rep, files) if gitleaks else None)):
+        try:
+            fn()
+        except Exception as exc:
+            rep.add("FAIL", "scanner-error", ".", f"{label} check stopped ({type(exc).__name__}): fix and re-run")
+    if not gitleaks:
+        rep.add("INFO", "gitleaks", ".", "gitleaks skipped (--no-gitleaks): say so in the release report")
     return rep.finish()
 
 
@@ -1303,8 +1736,9 @@ def print_report(rep: Report, root: Path, as_json: bool):
                           "findings": [asdict(f) for f in rep.findings]}, indent=2))
         return
     for f in rep.findings:
-        loc = f"{f.path}:{f.line}" if f.line else f.path
-        print(f"{f.severity:4}  {f.check:22} {loc}  {f.message}")
+        path = clean(f.path, 200)
+        loc = f"{path}:{f.line}" if f.line else path
+        print(f"{f.severity:4}  {clean(f.check, 30):22} {loc}  {clean(f.message, 300)}")
     print(f"\nrelease_scan {VERSION}: FAIL {summary['FAIL']}, WARN {summary['WARN']}, INFO {summary['INFO']}")
 
 
@@ -1323,37 +1757,49 @@ def atomic_write(path: Path, data: bytes, mode: int):
         raise
 
 
-JPEG_DROP = {0xE1, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEF, 0xFE}
+JPEG_KEEP_APP = {0xE0, 0xE2, 0xEE}  # JFIF, ICC profile, Adobe colour transform
 
 
 def strip_jpeg(data: bytes):
-    """Drops APP1 and APP3-APP13, APP15 and comments; keeps JFIF, ICC (APP2), Adobe (APP14)."""
-    out = [b"\xff\xd8"]
-    removed = []
-    for marker, start, end, _payload in jpeg_segments(data):
-        if marker == 0xDA:
-            out.append(data[start:])
-            return b"".join(out), removed
-        if marker in JPEG_DROP:
-            removed.append(f"APP{marker - 0xE0}" if marker != 0xFE else "COM")
-        else:
-            out.append(data[start:end])
-    raise ValueError("no image data found (not a complete JPEG)")
+    """Drops every APPn block except JFIF, ICC and Adobe, every comment, and anything after EOI."""
+    drops, removed, eoi = [], [], None
+    for marker, start, end, _payload in jpeg_walk(data):
+        if marker == 0xD9:
+            eoi = end
+            break
+        if (0xE0 <= marker <= 0xEF and marker not in JPEG_KEEP_APP) or marker == 0xFE:
+            drops.append((start, end))
+            removed.append("COM" if marker == 0xFE else f"APP{marker - 0xE0}")
+    if eoi is None:
+        raise ValueError("no end-of-image marker (truncated JPEG): re-export it")
+    out, last = [], 0
+    for s, e in drops:
+        out.append(data[last:s])
+        last = e
+    out.append(data[last:eoi])
+    if eoi < len(data):
+        removed.append(f"{len(data) - eoi} bytes after the end of the image")
+    new = b"".join(out)
+    if b"Exif\0\0" in new or b"<x:xmpmeta" in new or b"ns.adobe.com/xap" in new:
+        raise ValueError("metadata is still inside the image data after stripping: re-export the image")
+    return new, removed
 
 
 def strip_png(data: bytes):
     out = [PNG_SIG]
     removed = []
-    seen_end = False
-    for ctype, start, end, _payload in png_chunks(data):
-        if ctype in PNG_META:
-            removed.append(ctype.decode())
+    end = None
+    for ctype, start, cend, _payload in png_chunks(data):
+        if ctype in PNG_SAFE:
+            out.append(data[start:cend])
         else:
-            out.append(data[start:end])
+            removed.append(clean(ctype, 8))
         if ctype == b"IEND":
-            seen_end = True
-    if not seen_end:
+            end = cend
+    if end is None:
         raise ValueError("no IEND chunk (truncated PNG)")
+    if end < len(data):
+        removed.append(f"{len(data) - end} bytes after the end of the image")
     return b"".join(out), removed
 
 
@@ -1365,7 +1811,9 @@ def strip_file(path: Path, force=False) -> str:
         raise ValueError("not a regular file")
     if st.st_size > MAX_MEDIA:
         raise ValueError("file too large")
-    data = path.read_bytes()
+    data = read_regular(path, MAX_MEDIA)
+    if data is None:
+        raise ValueError("cannot read it as a regular file")
     if data[:2] == b"\xff\xd8":
         orient = jpeg_orientation(data)
         if orient not in (None, 1) and not force:
@@ -1402,7 +1850,7 @@ def main(argv=None):
     if args.cmd == "scan":
         root = Path(args.path)
         if not root.is_dir():
-            print(f"not a folder: {root}", file=sys.stderr)
+            print(f"not a folder: {clean(root, 200)}", file=sys.stderr)
             return 2
         cfg = load_config(args.config)
         rep = scan(root, cfg, history=not args.no_history, gitleaks=not args.no_gitleaks)
@@ -1414,9 +1862,9 @@ def main(argv=None):
     status = 0
     for f in args.files:
         try:
-            print(f"{f}: {strip_file(Path(f), force=args.force)}")
+            print(f"{clean(f, 200)}: {strip_file(Path(f), force=args.force)}")
         except (ValueError, OSError) as exc:
-            print(f"{f}: NOT stripped, {exc}", file=sys.stderr)
+            print(f"{clean(f, 200)}: NOT stripped, {clean(exc, 200)}", file=sys.stderr)
             status = 1
     return status
 

@@ -132,8 +132,16 @@ class RepoSettings(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("admins", detail)
 
+    def test_ruleset_excluding_the_branch_does_not_count(self):
+        rs = dict(rset.RULESET, id=1, conditions={"ref_name": {"include": ["~DEFAULT_BRANCH"],
+                                                              "exclude": ["refs/heads/main"]}})
+        gh = FakeGH(visibility="public", rulesets=[rs])
+        ok, _ = rset.check_branch(rset.Repo(NAME, gh), "public")
+        self.assertFalse(ok)
+
     def test_bad_repo_names_rejected(self):
-        for bad in ("--paginate", "octo", "octo/demo;rm", "../x/y", "octo/de mo"):
+        for bad in ("--paginate", "octo", "octo/demo;rm", "../x/y", "octo/de mo", "octo/demo\n",
+                    "octo/.", "octo/.."):
             with self.assertRaises(SystemExit):
                 rset.Repo(bad, FakeGH())
 

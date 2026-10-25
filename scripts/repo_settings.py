@@ -64,7 +64,7 @@ def run_gh(args, body=None):
 
 class Repo:
     def __init__(self, full_name, gh=run_gh):
-        if not REPO_RE.match(full_name):
+        if not REPO_RE.fullmatch(full_name) or full_name.split("/", 1)[1] in (".", ".."):
             raise SystemExit(f"not an OWNER/REPO name: {full_name!r}")
         self.name = full_name
         self.gh = gh
@@ -162,6 +162,8 @@ def _ruleset_protects(rs, branch):
     if rs.get("enforcement") != "active" or rs.get("target") != "branch":
         return False
     if rs.get("bypass_actors"):
+        return False
+    if ((rs.get("conditions") or {}).get("ref_name") or {}).get("exclude"):
         return False
     inc = ((rs.get("conditions") or {}).get("ref_name") or {}).get("include") or []
     if not any(p in ("~DEFAULT_BRANCH", "~ALL", f"refs/heads/{branch}") for p in inc):

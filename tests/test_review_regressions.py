@@ -99,7 +99,7 @@ class CodeReviewFixes(Base):
         fails = self.checks(rep, "FAIL")
         self.assertIn("sensitive-file", fails)
         self.assertTrue(any(c.startswith("gitleaks-") for c in fails), fails)
-        self.assertIn("gitleaks-config", self.checks(rep, "WARN"))
+        self.assertIn("gitleaks-config", fails)
 
     def test_unquoted_secret_in_a_config_file(self):
         pw = "Xq7" + "vR2mZ9pL4tW8sK1yB6"
@@ -219,6 +219,137 @@ class CodeReviewFixes(Base):
         self.commit("three")
         hits = [f for f in self.scan().findings if f.check == "github-token"]
         self.assertEqual(len(hits), 2)
+
+
+
+class DiffReviewFixes(Base):
+    """Regression tests for the findings of the second review (the fix diff)."""
+
+    def terms(self, *terms):
+        (self.home / "private-terms.txt").write_text("\n".join(terms) + "\n", encoding="utf-8")
+        return self.config(copyright_holder="Demo Holder")
+
+    def test_binary_magic_under_a_text_name(self):
+        cfg = self.terms("Acme")
+        tag = "".join(chr(0xE0000 + b) for b in b"do it")
+        body = ("hidden " + tag + " and \u202e <!-- x --> Acme\n").encode()
+        app0 = b"\xff\xe0" + struct.pack(">H", 302) + b"\x01" * 300
+        write(self.root, "references/guide.md", b"\xff\xd8" + app0 + body + b"\xff\xd9")
+        rep = self.scan(cfg)
+        fails = {f.check for f in rep.findings if f.path == "references/guide.md" and f.severity == "FAIL"}
+        self.assertTrue({"type-mismatch", "hidden-unicode", "private-term"} <= fails, fails)
+
+    def test_agent_instruction_files_fail(self):
+        for rel in ("CLAUDE.md", "docs/CLAUDE.local.md", "AGENTS.md", ".claude/commands/go.md",
+                    ".claude-plugin/plugin.json"):
+            write(self.root, rel, "x\n")
+        hits = {f.path for f in self.scan().findings if f.check == "agent-config"}
+        self.assertEqual(hits, {"CLAUDE.md", "docs/CLAUDE.local.md", "AGENTS.md", ".claude/commands/go.md",
+                                ".claude-plugin/plugin.json"})
+
+    def test_renamed_and_deleted_history_paths(self):
+        cfg = self.terms("Zorblatt")
+        write(self.root, "examples/zorblatt-invoice/a.md", "same\n")
+        write(self.root, "clients/Zorblatt/.gitkeep", "")
+        write(self.root, "empty.txt", "")
+        self.commit("add")
+        os.rename(self.root / "examples/zorblatt-invoice", self.root / "examples/demo-invoice")
+        shutil.rmtree(self.root / "clients")
+        self.commit("rename")
+        hits = [f.path for f in self.scan(cfg).findings if f.check == "private-term"]
+        self.assertTrue(any("zorblatt-invoice" in h for h in hits), hits)
+        self.assertTrue(any("clients/Zorblatt" in h for h in hits), hits)
+
+    @unittest.skipUnless(shutil.which("gitleaks"), "gitleaks not installed")
+    def test_gitattributes_cannot_hide_history_from_gitleaks(self):
+        token = "glpat-" + "Ab3dE5fG7hJ9kL1mN3pQ"
+        write(self.root, ".gitattributes", "*.txt -diff\n")
+        write(self.root, "notes.txt", f"token {token}\n")
+        self.commit("add")
+        write(self.root, "notes.txt", "clean\n")
+        self.commit("clean")
+        rep = rs.scan(self.root, self.config(), history=True, gitleaks=True)
+        self.assertIn("gitleaks-history", self.checks(rep, "FAIL"))
+        self.assertIn("gitattributes", self.checks(rep, "WARN"))
+
+    def test_frontmatter_spellings_fail_closed(self):
+        for line in ('"hooks": x', "hooks : x", "'allowed-tools': Bash", "Hooks: x", "{hooks: x}"):
+            write(self.root, "SKILL.md", f"---\nname: demo-skill\ndescription: d\n{line}\n---\n## Step 1: intake\n")
+            self.assertIn("skill-frontmatter", self.checks(self.scan(), "FAIL"), line)
+
+    def test_photo_inside_office_file_and_data_uri(self):
+        gps_jpeg = jpeg(tiff([(0x010F, "Cam")], gps=[(1, "N")]))
+        with zipfile.ZipFile(self.root / "deck.pptx", "w") as zf:
+            zf.writestr("[Content_Types].xml", "<Types/>")
+            zf.writestr("ppt/media/image1.jpeg", gps_jpeg)
+        rep = self.scan()
+        self.assertTrue(any(f.check == "gps-location" and "deck.pptx" in f.path for f in rep.findings))
+        os.unlink(self.root / "deck.pptx")
+        import base64
+        uri = base64.b64encode(gps_jpeg).decode()
+        write(self.root, "docs/logo.svg", f'<svg xmlns="http://www.w3.org/2000/svg"><image href="data:image/jpeg;base64,{uri}"/></svg>\n')
+        rep = self.scan()
+        self.assertTrue(any(f.check == "gps-location" and "logo.svg" in f.path for f in rep.findings))
+
+    def test_more_ignorable_characters(self):
+        for cp in (0x180B, 0x180F, 0x17B4, 0x2065, 0x1D173):
+            write(self.root, "references/guide.md", f"a{chr(cp)}b\n")
+            self.assertIn("hidden-unicode", self.checks(self.scan(), "FAIL"), hex(cp))
+
+    def test_pdf_octal_escapes(self):
+        cfg = self.terms("Zorblatt")
+        octal = "".join("\\%03o" % c for c in b"Zorblatt")
+        write(self.root, "d.pdf", ("%PDF-1.4\n1 0 obj <</Author (" + octal + ")>> endobj\n").encode() + bytes(64))
+        self.assertIn("private-term", self.checks(self.scan(cfg), "FAIL"))
+
+
+class RunIsolated(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        import run_isolated
+        self.ri = run_isolated
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_clean_environment_and_cwd(self):
+        seen = {}
+
+        class Res:
+            returncode = 3
+
+        def runner(cmd, cwd, env, timeout):
+            seen.update(cmd=cmd, cwd=cwd, env=env)
+            return Res()
+        os.environ["SSH_AUTH_SOCK"] = "/tmp/fake-agent"
+        os.environ["GH_TOKEN"] = "x" * 10
+        try:
+            code = self.ri.run(self.tmp, ["python3", "-c", "pass"], runner=runner, out=lambda *_: None)
+        finally:
+            os.environ.pop("SSH_AUTH_SOCK", None)
+            os.environ.pop("GH_TOKEN", None)
+        self.assertEqual(code, 3)
+        self.assertEqual(set(seen["env"]), {"PATH", "HOME", "SKILL_RELEASE_HOME", "TMPDIR", "LANG",
+                                            "PYTHONDONTWRITEBYTECODE"})
+        self.assertTrue(seen["env"]["HOME"].startswith(os.path.realpath(self.tmp)) or
+                        seen["env"]["HOME"].startswith(self.tmp))
+        self.assertEqual(seen["cwd"], os.path.abspath(self.tmp))
+        self.assertTrue(os.path.isdir(seen["env"]["HOME"]))
+
+    def test_real_run_sees_scratch_home(self):
+        out = Path(self.tmp) / "h.txt"
+        code = self.ri.main([self.tmp, "--", sys.executable, "-c",
+                             f"import os; open({str(out)!r}, 'w').write(os.environ['HOME'] + '|' + os.environ.get('SSH_AUTH_SOCK', ''))"])
+        self.assertEqual(code, 0)
+        home, sock = out.read_text().split("|")
+        self.assertTrue(home.endswith("/home"))
+        self.assertEqual(sock, "")
+
+    def test_needs_separator(self):
+        with self.assertRaises(SystemExit):
+            self.ri.main([self.tmp, "echo"])
 
 
 if __name__ == "__main__":

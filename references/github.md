@@ -29,7 +29,7 @@ Fresh clone check (what GitHub holds is what goes public):
 ```bash
 tmp=$(mktemp -d) && gh repo clone "OWNER/NAME" "$tmp/c" -- --quiet
 python3 "$SKILL/scripts/release_scan.py" scan "$tmp/c"
-(cd "$tmp/c" && <the skill's test command>)
+python3 "$SKILL/scripts/run_isolated.py" "$SCRATCH" --cwd "$tmp/c" -- python3 -m unittest discover -s tests
 ```
 
 ## Go public (only after the owner's yes)
@@ -63,7 +63,10 @@ tmp=$(mktemp -d)
 env -u GH_TOKEN -u GITHUB_TOKEN GIT_TERMINAL_PROMPT=0 \
   git -c credential.helper= clone --quiet "https://github.com/OWNER/NAME" "$tmp/anon"
 python3 "$SKILL/scripts/release_scan.py" scan "$tmp/anon"
+python3 "$SKILL/scripts/run_isolated.py" "$SCRATCH" --cwd "$tmp/anon" -- python3 -m unittest discover -s tests
 ```
+
+Use the skill's own test command if it differs, after reading it.
 
 Topics and description:
 

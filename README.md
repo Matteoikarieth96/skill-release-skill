@@ -32,8 +32,9 @@ report. Asking it to "publish" starts the process; it is not that yes.
    (inputs, generated output, commands and network, and the SKILL.md prompt
    itself); a content reviewer checks privacy, licences, brands and claims;
    a cold-start tester installs the skill from a clone with a scratch `HOME`
-   and uses it like a stranger. Code from the reviewed skill only ever runs
-   with a scratch `HOME`, never with your settings or your `gh` login. Every finding is reproduced before it is
+   and uses it like a stranger. Code from the reviewed skill runs through
+   `scripts/run_isolated.py`: no shell, an empty environment, a scratch `HOME`,
+   no SSH agent or tokens. That is isolation, not a sandbox. Every finding is reproduced before it is
    fixed, and gets a regression test.
 6. **Creates the repo private**, applies the private-stage settings, waits for
    CI, and re-scans a fresh clone from GitHub.
@@ -110,6 +111,7 @@ The scanner also works alone:
 python3 ~/.claude/skills/skill-release/scripts/release_scan.py scan path/to/staging
 python3 ~/.claude/skills/skill-release/scripts/release_scan.py strip path/to/staging/docs/hero.jpg
 python3 ~/.claude/skills/skill-release/scripts/repo_settings.py check OWNER/REPO --stage public
+python3 ~/.claude/skills/skill-release/scripts/run_isolated.py /tmp/scratch --cwd path/to/staging -- python3 -m unittest discover -s tests
 ```
 
 `scan` exits 1 on any FAIL (`--strict` also on WARN), `--json` for machine

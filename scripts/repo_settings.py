@@ -161,7 +161,7 @@ def fix_private_reporting(repo):
 def _ruleset_protects(rs, branch):
     if rs.get("enforcement") != "active" or rs.get("target") != "branch":
         return False
-    if rs.get("bypass_actors"):
+    if rs.get("bypass_actors") is None or rs.get("bypass_actors"):
         return False
     if ((rs.get("conditions") or {}).get("ref_name") or {}).get("exclude"):
         return False
@@ -279,7 +279,7 @@ def post_publish(path=None, runner=subprocess.run, out=print):
         argv = [os.path.expanduser(a) for a in cmd]
         out("RUN      " + shlex.join(argv))
         try:
-            res = runner(argv, timeout=900)
+            res = runner(argv, timeout=900, cwd=os.path.expanduser("~"))
             code = res.returncode
         except (OSError, subprocess.TimeoutExpired) as exc:
             out(f"FAILED   {exc}")

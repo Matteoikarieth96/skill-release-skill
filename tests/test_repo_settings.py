@@ -139,6 +139,12 @@ class RepoSettings(unittest.TestCase):
         ok, _ = rset.check_branch(rset.Repo(NAME, gh), "public")
         self.assertFalse(ok)
 
+    def test_ruleset_without_bypass_field_does_not_count(self):
+        rs = {k: v for k, v in dict(rset.RULESET, id=1).items() if k != "bypass_actors"}
+        gh = FakeGH(visibility="public", rulesets=[rs])
+        ok, _ = rset.check_branch(rset.Repo(NAME, gh), "public")
+        self.assertFalse(ok)
+
     def test_bad_repo_names_rejected(self):
         for bad in ("--paginate", "octo", "octo/demo;rm", "../x/y", "octo/de mo", "octo/demo\n",
                     "octo/.", "octo/.."):
@@ -162,14 +168,16 @@ class PostPublish(unittest.TestCase):
 
     def run_pp(self, codes=()):
         calls, lines = [], []
+        self.cwds = []
         codes = list(codes)
 
         class Res:
             def __init__(self, c):
                 self.returncode = c
 
-        def runner(argv, timeout):
+        def runner(argv, timeout, cwd=None):
             calls.append(argv)
+            self.cwds.append(cwd)
             return Res(codes.pop(0) if codes else 0)
         code = rset.post_publish(self.cfg, runner=runner, out=lines.append)
         return code, calls, "\n".join(lines)
@@ -181,6 +189,11 @@ class PostPublish(unittest.TestCase):
         self.assertEqual(calls[0][1], os.path.expanduser("~/dir with space/guard.py"))
         self.assertEqual(len(calls), 2)
         self.assertIn("RUN", out)
+
+    def test_commands_run_from_the_home_folder(self):
+        self.write({"post_publish_commands": [["true"]]})
+        self.run_pp()
+        self.assertEqual(self.cwds, [os.path.expanduser("~")])
 
     def test_failure_is_exit_1(self):
         self.write({"post_publish_commands": [["false"], ["true"]]})

@@ -22,6 +22,8 @@ Standard library only, Python 3.9 or newer.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import bisect
 import codecs
 import fnmatch
@@ -264,7 +266,15 @@ LOCAL_HOST = re.compile(r"(?<![.\w-])([A-Za-z0-9-]{3,63})\.local\b(?!\.[A-Za-z])
 CURL_PIPE_SHELL = re.compile(r"(?:curl|wget)[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b")
 PLACEHOLDER_LEFT = re.compile(r"\{\{[A-Z][A-Z0-9_]*\}\}")
 NON_PLAIN = re.compile(r"[^\x09\x0a\x0d\x20-\x7e]")
-INVISIBLE_EXTRA = {0x034F, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x180E}
+# Unicode Default_Ignorable_Code_Point ranges (invisible by design), plus the braille blank.
+IGNORABLE = ((0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160), (0x17B4, 0x17B5),
+             (0x180B, 0x180F), (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x206F), (0x2800, 0x2800),
+             (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF), (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8),
+             (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A), (0xE0000, 0xE0FFF))
+
+
+def ignorable(cp: int) -> bool:
+    return any(a <= cp <= b for a, b in IGNORABLE)
 GITLEAKS_ALLOW = "gitleaks" + ":allow"
 CONFIG_EXT = {"", ".env", ".envrc", ".ini", ".cfg", ".conf", ".properties", ".toml", ".yaml", ".yml",
               ".txt", ".sh", ".bash", ".zsh"}
@@ -306,8 +316,7 @@ def hidden_chars(text: str):
         if cp == 0x200D and prev and nxt and _emoji_base(prev) and _emoji_base(nxt):
             continue
         cat = unicodedata.category(ch)
-        if cat in ("Cf", "Zl", "Zp") or cp in INVISIBLE_EXTRA or 0xFE00 <= cp <= 0xFE0F \
-                or 0xE0100 <= cp <= 0xE01EF:
+        if cat in ("Cf", "Zl", "Zp") or ignorable(cp):
             yield i, cp, "FAIL"
         elif cat in ("Co", "Cn"):
             yield i, cp, "WARN"
@@ -871,7 +880,31 @@ def _png_text(key: bytes, val: bytes, where, rep, cfg):
     _terms_in_strings([text], where, rep, cfg)
 
 
-PDF_INFO = re.compile(r"/(Author|Creator|Producer|Title|Subject|Keywords)\s*\(([^)]{0,200})\)")
+PDF_INFO = re.compile(r"/(Author|Creator|Producer|Title|Subject|Keywords)\s*\(((?:\\.|[^\\)]){0,400})\)", re.S)
+PDF_ESC = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f", "(": "(", ")": ")", "\\": "\\"}
+
+
+def _pdf_literal(value: str) -> str:
+    """Decodes a PDF literal string: backslash escapes, octal codes, UTF-16BE with BOM."""
+    out, i = [], 0
+    while i < len(value):
+        ch = value[i]
+        if ch == "\\" and i + 1 < len(value):
+            nxt = value[i + 1]
+            m = re.match(r"[0-7]{1,3}", value[i + 1:i + 4])
+            if m:
+                out.append(chr(int(m.group(0), 8) & 0xFF))
+                i += 1 + len(m.group(0))
+                continue
+            out.append(PDF_ESC.get(nxt, nxt))
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    raw = "".join(out)
+    if raw.startswith("\xfe\xff"):
+        return raw[2:].encode("latin-1", "replace").decode("utf-16-be", "replace")
+    return raw
 PDF_INFO_HEX = re.compile(r"/(Author|Creator|Producer|Title|Subject|Keywords)\s*<([0-9A-Fa-f\s]{2,1000})>")
 PDF_STREAM = re.compile(rb"(?<!end)stream\r?\n")
 
@@ -888,7 +921,7 @@ def _pdf_hex(value: str) -> str:
 
 def scan_pdf(data, where, rep, cfg):
     text = data.decode("latin-1")
-    for rx, decode in ((PDF_INFO, lambda v: v), (PDF_INFO_HEX, _pdf_hex)):
+    for rx, decode in ((PDF_INFO, _pdf_literal), (PDF_INFO_HEX, _pdf_hex)):
         for m in rx.finditer(text):
             value = decode(m.group(2))
             sev = "INFO" if m.group(1) == "Producer" else "WARN"
@@ -923,6 +956,7 @@ def scan_video(data, where, rep, cfg):
 
 OFFICE_EXTS = (".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".pptm", ".odt", ".ods", ".odp")
 PART_CAP = 5_000_000
+MEDIA_PART_CAP = 16_000_000
 DOC_TOTAL_CAP = 40_000_000
 
 
@@ -943,6 +977,25 @@ def scan_zip(data, where, rep, cfg, name):
     total = 0
     for info in infos[:5000]:
         if not info.filename.endswith((".xml", ".rels")):
+            if info.is_dir():
+                continue
+            try:
+                with zf.open(info) as fh:
+                    blob = fh.read(MEDIA_PART_CAP + 1)
+            except Exception:
+                rep.add("WARN", "document-metadata", where,
+                        f"could not read part {clean(info.filename, 40)}: check the document by hand")
+                continue
+            total += len(blob)
+            if total > DOC_TOTAL_CAP:
+                rep.add("WARN", "document-metadata", where, "document only partly scanned (size cap)")
+                break
+            part = f"{where} > {clean(info.filename, 60)}"
+            if blob[:4] == b"PK\x03\x04":
+                rep.add("FAIL", "archive", part, "archive nested inside a document: not scanned")
+            else:
+                scan_media(info.filename, blob[:MEDIA_PART_CAP], part, rep, cfg)
+            scan_text(blob[:MAX_TEXT].decode("latin-1"), part, rep, cfg, leak_only=True, binary=True)
             continue
         try:
             with zf.open(info) as fh:
@@ -1035,8 +1088,9 @@ JUNK_WARN = [
 ]
 JUNK_DIRS = {"__pycache__", "node_modules", ".venv", "venv", ".idea", ".vscode", ".pytest_cache",
              ".mypy_cache", ".claude", ".ipynb_checkpoints", "dist", "build"}
-AGENT_CONFIG = re.compile(r"(?:^|/)(?:\.claude/settings(?:\.local)?\.json|hooks/hooks\.json|\.mcp\.json)$",
-                          re.I)
+AGENT_CONFIG = re.compile(
+    r"(?:^|/)(?:\.claude/|\.claude-plugin/|CLAUDE(?:\.local)?\.md$|AGENTS\.md$|hooks/hooks\.json$|\.mcp\.json$)",
+    re.I)
 BAD_NAME_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
@@ -1054,15 +1108,15 @@ def check_name(rel: str, rep: Report, where: str, cfg=None):
             rep.add("FAIL", "private-term", shown, f"private term {clean(m.group(0), 40)!r} in the file name")
     if AGENT_CONFIG.search(rel):
         rep.add("FAIL", "agent-config", shown,
-                "Claude Code settings, hooks or MCP config: they grant permissions or run "
-                "commands on every user's machine; a skill does not ship them")
+                "agent instructions or config (CLAUDE.md, AGENTS.md, .claude/, plugin manifest, hooks, MCP): "
+                "agents load them as instructions or settings on every user's machine; a skill does not ship them")
     elif low not in SENSITIVE_OK and any(fnmatch.fnmatchcase(low, p) for p in SENSITIVE_FAIL):
         rep.add("FAIL", "sensitive-file", shown, f"file type that usually holds secrets: {clean(base, 60)}")
     elif any(fnmatch.fnmatchcase(low, p) for p in JUNK_WARN):
         rep.add("WARN", "junk-file", shown, f"should not be published: {clean(base, 60)}")
     if low.startswith(".gitleaks"):
-        rep.add("WARN", "gitleaks-config", shown,
-                "gitleaks configuration in the repo: this scan ignores it, but it silences gitleaks elsewhere")
+        rep.add("WARN" if "(history" in where else "FAIL", "gitleaks-config", shown,
+                "gitleaks configuration in the repo: it can silence gitleaks; remove it")
     bad_dirs = [p for p in parts if p in JUNK_DIRS]
     if bad_dirs:
         rep.add("WARN", "junk-dir", shown, f"inside {clean(bad_dirs[0], 30)}/: add it to .gitignore")
@@ -1110,16 +1164,24 @@ def is_binary(data: bytes) -> bool:
 
 TEXT_EXT = CODE_EXT | {".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
                        ".csv", ".tsv", ".xml", ".svg", ".css", ".rst", ".env", ".envrc", ".properties",
-                       ".jsonl", ".ipynb", ""}
+                       ".jsonl", ".ipynb"}
+TEXT_NAMES = {"license", "licence", "readme", "makefile", "dockerfile", "copying", "notice", "authors",
+              "changelog", "procfile", "gemfile", ".gitignore", ".gitattributes", ".envrc", ".env",
+              ".npmrc", ".editorconfig", ".gitleaksignore"}
+DATA_URI = re.compile(r"data:(?:image|application)/[A-Za-z0-9.+-]{1,30};base64,([A-Za-z0-9+/=\s]{40,22000000})")
 
 
 def scan_bytes(rel: str, data: bytes, rep: Report, cfg, origin: str = "", full: bool = True):
     where = f"{rel} ({origin})" if origin else rel
-    ext = os.path.splitext(rel.lower())[1]
+    base = rel.rsplit("/", 1)[-1].lower()
+    ext = os.path.splitext(base)[1]
+    texty = ext in TEXT_EXT or base in TEXT_NAMES
     recognised = scan_media(rel, data[:MAX_MEDIA], where, rep, cfg)
+    if recognised and texty:
+        rep.add("FAIL", "type-mismatch", where, "a text-named file holds a binary format: rename or remove it")
     text, enc = decode_text(data[:MAX_TEXT])
-    if text is None and not recognised and ext in TEXT_EXT:
-        # A text file full of control characters is still read as text.
+    if text is None and texty:
+        # A file named as text is always read as text, whatever its first bytes say.
         text, enc = data[:MAX_TEXT].decode("utf-8", "replace").replace("\0", ""), "utf-8 with control characters"
     if text is None:
         if not recognised and full:
@@ -1133,6 +1195,18 @@ def scan_bytes(rel: str, data: bytes, rep: Report, cfg, origin: str = "", full: 
     if len(data) > MAX_TEXT:
         rep.add("WARN", "large-text", where, f"only the first {MAX_TEXT} bytes were scanned")
     scan_text(text, rel, rep, cfg, ext=ext, origin=origin, full=full)
+    for n, m in enumerate(DATA_URI.finditer(text) if full else ()):
+        if n >= 50:
+            rep.add("WARN", "data-uri", where, "more than 50 embedded data URIs: the rest were not inspected")
+            break
+        try:
+            blob = base64.b64decode(re.sub(r"\s", "", m.group(1)), validate=False)
+        except (ValueError, binascii.Error):
+            continue
+        sub_where = f"{where} > data URI"
+        scan_media("data-uri", blob[:MAX_MEDIA], sub_where, rep, cfg)
+        scan_text(blob[:MAX_TEXT].decode("latin-1"), rel, rep, cfg, origin="data URI", leak_only=True,
+                  binary=True)
     if ext == ".svg" and full:
         if re.search(r"<metadata\b", text):
             rep.add("WARN", "svg-metadata", where, "SVG <metadata> block: check or remove it")
@@ -1325,7 +1399,7 @@ def scan_tree(root: Path, use_git: bool, rep: Report, cfg) -> set:
     return shas
 
 
-def scan_history(root: Path, rep: Report, cfg, current_shas: set):
+def scan_history(root: Path, rep: Report, cfg, current_shas: set, current_names=(), dump_dir=None):
     r = git(root, "rev-list", "--all", "--objects")
     if r.returncode != 0:
         return
@@ -1346,8 +1420,6 @@ def scan_history(root: Path, rep: Report, cfg, current_shas: set):
         sha, size = parts[0], int(parts[2])
         if sha in current_shas:
             continue
-        rel = paths[sha]
-        check_name(rel, rep, f"{rel} (history {sha[:7]})", cfg)
         if size > MAX_MEDIA or total + size > MAX_HISTORY_TOTAL:
             skipped += 1
             continue
@@ -1355,10 +1427,23 @@ def scan_history(root: Path, rep: Report, cfg, current_shas: set):
         wanted.append(sha)
     if skipped:
         rep.add("WARN", "history-partial", ".", f"{skipped} large blobs in the history were not scanned")
+    # Every path that ever existed, also renamed or deleted ones whose content is still current.
+    log = git(root, "log", "--all", "--no-renames", "--name-only", "-z", "--format=")
+    seen_names = set(current_names)
+    for entry in log.stdout.split(b"\0"):
+        name = entry.strip(b"\n").decode("utf-8", "replace")
+        if name and name not in seen_names:
+            seen_names.add(name)
+            check_name(name, rep, f"{name} (history)", cfg)
     hist = Report()
     hist.CAP = 10 ** 9
     for sha, typ, data in cat_file_batch(root, wanted):
         rel = paths.get(sha, sha)
+        if dump_dir is not None:
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", rel)[-150:]
+            folder = Path(dump_dir) / sha[:12]
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / safe).write_bytes(data)
         origin = f"history {sha[:7]}, find it with git log --all --find-object={sha[:12]}"
         try:
             scan_bytes(rel, data, hist, cfg, full=False, origin=origin)
@@ -1443,7 +1528,7 @@ def scan_commits(root: Path, rep: Report, cfg):
 GITLEAKS_DEFAULT_CONFIG = "[extend]\nuseDefault = true\n"
 
 
-def run_gitleaks(root: Path, use_git: bool, rep: Report, files):
+def run_gitleaks(root: Path, use_git: bool, rep: Report, files, history_dir=None):
     """gitleaks with its default rules only, on a copy of exactly the files a publish
     would include, plus the history. Repo-level gitleaks config and allow comments
     are ignored, so the scanned repo cannot silence it."""
@@ -1469,6 +1554,9 @@ def run_gitleaks(root: Path, use_git: bool, rep: Report, files):
         ignore_dir = Path(td) / "no-ignore"
         ignore_dir.mkdir()
         modes = [("dir", ["dir", str(copy)], ["detect", "--no-git", "--source", str(copy)])]
+        if history_dir is not None and any(Path(history_dir).iterdir()):
+            # Raw history blobs: .gitattributes (binary, -diff) cannot hide them from gitleaks.
+            modes.append(("history", ["dir", str(history_dir)], ["detect", "--no-git", "--source", str(history_dir)]))
         if use_git:
             modes.append(("git", ["git", str(root)], ["detect", "--source", str(root)]))
         for label, new, legacy in modes:
@@ -1489,7 +1577,7 @@ def run_gitleaks(root: Path, use_git: bool, rep: Report, files):
                     results = json.load(fh) or []
             except (OSError, ValueError):
                 results = []
-            base = copy if label == "dir" else root
+            base = {"dir": copy, "history": Path(history_dir or td)}.get(label, root)
             for f in results:
                 file = str(f.get("File", ""))
                 try:
@@ -1541,6 +1629,16 @@ def check_skill(root: Path, rep: Report, cfg):
         rep.add("FAIL", "skill-md", "SKILL.md", "no YAML frontmatter (--- name / description ---)")
         return
     name, desc = fields.get("name", ""), fields.get("description", "")
+    raw_fm = FRONTMATTER.match(text).group(1)
+    for line in raw_fm.splitlines():
+        if not line.strip() or line.startswith((" ", "\t", "#")):
+            continue
+        km = re.match(r"([A-Za-z0-9_-]{1,64}):(?:[ \t]|$)", line)
+        if not km:
+            rep.add("FAIL", "skill-frontmatter", "SKILL.md",
+                    f"top-level frontmatter line in an unusual form: {clean(line, 50)!r} (use plain keys)")
+        elif km.group(1).lower() == "hooks" and km.group(1) != "hooks":
+            rep.add("FAIL", "skill-frontmatter", "SKILL.md", "frontmatter key spelled like 'hooks'")
     for key in fields:
         if key == "hooks":
             rep.add("FAIL", "skill-frontmatter", "SKILL.md",
@@ -1632,6 +1730,10 @@ def check_repo_files(root: Path, rep: Report, cfg, files):
         rep.add("WARN", "security-md", "SECURITY.md", "does not say how to report privately")
     if ".gitignore" not in names:
         rep.add("WARN", "gitignore", ".", "no .gitignore")
+    attrs = read_text_regular(root / ".gitattributes") if ".gitattributes" in names else None
+    if attrs and re.search(r"(?:^|\s)(?:-diff|-text|binary|diff=|filter=|merge=)", attrs):
+        rep.add("WARN", "gitattributes", ".gitattributes",
+                "attributes that hide or transform content in diffs: check why they are needed")
     if ".gitmodules" in names:
         rep.add("WARN", "submodules", ".gitmodules", "submodules pull in code that this scan does not see")
     workflows = [n for n in names if re.match(r"^\.github/workflows/[^/]+\.ya?ml$", n)]
@@ -1711,6 +1813,9 @@ def scan(root: Path, cfg, *, history=True, gitleaks=True) -> Report:
         rep.add("WARN", "config", ".", "no private terms loaded: names of people, clients and "
                 "private projects are not checked (see README, private settings)")
     files = list_files(root, use_git, Report())
+    names = {rel for rel, _ in files}
+    dump = tempfile.TemporaryDirectory() if (gitleaks and use_git and history) else None
+    dump_dir = dump.name if dump else None
     shas: set = set()
     try:
         shas = scan_tree(root, use_git, rep, cfg)
@@ -1719,13 +1824,16 @@ def scan(root: Path, cfg, *, history=True, gitleaks=True) -> Report:
     for label, fn in (("SKILL.md", lambda: check_skill(root, rep, cfg)),
                       ("repo files", lambda: check_repo_files(root, rep, cfg, files)),
                       ("links", lambda: check_links(root, rep, files)),
-                      ("history", lambda: scan_history(root, rep, cfg, shas) if use_git and history else None),
+                      ("history", lambda: scan_history(root, rep, cfg, shas, names, dump_dir)
+                       if use_git and history else None),
                       ("commits", lambda: scan_commits(root, rep, cfg) if use_git and history else None),
-                      ("gitleaks", lambda: run_gitleaks(root, use_git, rep, files) if gitleaks else None)):
+                      ("gitleaks", lambda: run_gitleaks(root, use_git, rep, files, dump_dir) if gitleaks else None)):
         try:
             fn()
         except Exception as exc:
             rep.add("FAIL", "scanner-error", ".", f"{label} check stopped ({type(exc).__name__}): fix and re-run")
+    if dump:
+        dump.cleanup()
     if not gitleaks:
         rep.add("INFO", "gitleaks", ".", "gitleaks skipped (--no-gitleaks): say so in the release report")
     return rep.finish()

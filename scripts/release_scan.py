@@ -1176,8 +1176,10 @@ SAFE_GIT_KEY = re.compile(
     r"|symlinks|autocrlf|safecrlf|eol|quotepath)"
     r"|remote\.[^\n]{1,200}\.(?:url|fetch|pushurl|tagopt|prune)"
     r"|branch\.[^\n]{1,200}\.(?:remote|merge|rebase|pushremote)"
+    r"|branch\.[^\n]{1,200}\.vscode-merge-base"
     r"|user\.(?:name|email)|init\.defaultbranch|http\.postbuffer|pull\.rebase|push\.default"
-    r"|extensions\.objectformat", re.I)
+    r"|extensions\.objectformat|lfs\.repositoryformatversion|rerere\.enabled|merge\.conflictstyle"
+    r"|color\.ui|fetch\.prune", re.I)
 
 
 def git_env():

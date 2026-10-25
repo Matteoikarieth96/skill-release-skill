@@ -617,9 +617,18 @@ class SelfScan(unittest.TestCase):
         old = os.environ.get("SKILL_RELEASE_HOME")
         empty = tempfile.mkdtemp()
         os.environ["SKILL_RELEASE_HOME"] = empty
+        clone = None
         try:
-            rep = rs.scan(ROOT, rs.load_config(), history=False, gitleaks=False)
+            target = ROOT
+            if rs.git_config_problem(ROOT):
+                # A CI checkout carries extra git config: scan a plain clone, as the FAIL says.
+                clone = Path(tempfile.mkdtemp()) / "clone"
+                subprocess.run(["git", "clone", "-q", "--no-local", str(ROOT), str(clone)], check=True)
+                target = clone
+            rep = rs.scan(target, rs.load_config(), history=False, gitleaks=False)
         finally:
+            if clone is not None:
+                shutil.rmtree(clone.parent, ignore_errors=True)
             if old is None:
                 os.environ.pop("SKILL_RELEASE_HOME", None)
             else:

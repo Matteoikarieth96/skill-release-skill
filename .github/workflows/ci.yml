@@ -26,5 +26,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Unit tests
         run: python -m unittest discover -s tests -v
-      - name: The repo passes its own scan (history included)
-        run: python scripts/release_scan.py scan . --no-gitleaks
+      - name: The repo passes its own scan (history included), on a plain clone
+        run: |
+          git clone -q --no-local . "$RUNNER_TEMP/clone"
+          python scripts/release_scan.py scan "$RUNNER_TEMP/clone" --no-gitleaks

@@ -7,7 +7,8 @@ Usage:
 The command runs without a shell and with an empty environment except:
 PATH (system folders plus the folder of the python3 running this script),
 HOME=SCRATCH/home, SKILL_RELEASE_HOME=SCRATCH/local, TMPDIR=SCRATCH/tmp,
-LANG=C.UTF-8 and PYTHONDONTWRITEBYTECODE=1. Your SSH agent, gh, git and cloud
+LANG=C.UTF-8, PYTHONDONTWRITEBYTECODE=1, and GIT_CONFIG_NOSYSTEM /
+GIT_CONFIG_GLOBAL so git ignores the system and your global config. Your SSH agent, gh, git and cloud
 credentials in environment variables are not passed, and HOME points away
 from your settings. The working folder defaults to SCRATCH.
 
@@ -37,6 +38,9 @@ def clean_env(scratch: str) -> dict:
         "TMPDIR": os.path.join(scratch, "tmp"),
         "LANG": "C.UTF-8",
         "PYTHONDONTWRITEBYTECODE": "1",
+        # git inside the command reads neither the system nor your global config.
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
     }
 
 

@@ -18,7 +18,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_release_scan import AWS, GH_TOKEN, MAIL, PW2, Base, jpeg, rs, tiff, write  # noqa: E402
+from test_release_scan import AWS, GH_TOKEN, MAIL, PW2, Base, git, jpeg, rs, tiff, write  # noqa: E402
 
 
 class CodeReviewFixes(Base):
@@ -303,6 +303,88 @@ class DiffReviewFixes(Base):
         self.assertIn("private-term", self.checks(self.scan(cfg), "FAIL"))
 
 
+class FinalReviewFixes(Base):
+    """Regression tests for the findings of the third fix review."""
+
+    def terms(self, *terms):
+        (self.home / "private-terms.txt").write_text("\n".join(terms) + "\n", encoding="utf-8")
+        return self.config(copyright_holder="Demo Holder")
+
+    def test_live_git_hook_stops_git(self):
+        self.commit()
+        hook = self.root / ".git" / "hooks" / "pre-push"
+        hook.write_text("#!/bin/sh\nexit 0\n")
+        rep = self.scan()
+        self.assertTrue(any(f.check == "unsafe-git" and "hooks" in f.message for f in rep.findings))
+
+    def test_media_magic_under_other_names(self):
+        tag = "".join(chr(0xE0000 + b) for b in b"do it")
+        body = ("hidden " + tag + " \u202e\n").encode()
+        for name in ("references/guide.markdown", "references/guide.mdx", "references/GUIDE"):
+            write(self.root, name, b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00" + body)
+        rep = self.scan()
+        for name in ("references/guide.markdown", "references/guide.mdx", "references/GUIDE"):
+            got = {f.check for f in rep.findings if f.path == name and f.severity == "FAIL"}
+            self.assertTrue({"type-mismatch", "hidden-unicode"} <= got, (name, got))
+
+    def test_extensionless_file_with_control_padding(self):
+        write(self.root, "references/notes", b"\x01" * 300 + "x \u202e y\n".encode())
+        self.assertIn("hidden-unicode", self.checks(self.scan(), "FAIL"))
+
+    def test_merge_only_history_path(self):
+        cfg = self.terms("Zorblatt")
+        self.commit("base")
+        git(self.root, "checkout", "-q", "-b", "side")
+        write(self.root, "side.md", "side\n")
+        self.commit("side")
+        git(self.root, "checkout", "-q", "main")
+        write(self.root, "main.md", "main\n")
+        self.commit("main")
+        git(self.root, "merge", "-q", "--no-commit", "side")
+        write(self.root, "clients/Zorblatt-notes.md", "x\n")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "merge")
+        os.unlink(self.root / "clients/Zorblatt-notes.md")
+        self.commit("remove")
+        hits = [f.path for f in self.scan(cfg).findings if f.check == "private-term"]
+        self.assertTrue(any("Zorblatt-notes" in h for h in hits), hits)
+
+    def test_pdf_literal_forms(self):
+        cfg = self.terms("Zorblatt")
+        octal = "".join("\\%03o" % c for c in b"Zorblatt")
+        forms = {
+            "nested.pdf": "1 0 obj <</Author (a(b) " + octal + ")>> endobj",
+            "continued.pdf": "1 0 obj <</Author (Zorb\\\nlatt)>> endobj",
+            "long.pdf": "1 0 obj <</Author (" + "x " * 300 + "Zorblatt)>> endobj",
+            "indirect.pdf": "1 0 obj <</Author 5 0 R>> endobj 5 0 obj (" + octal + ") endobj",
+        }
+        for name, body in forms.items():
+            write(self.root, name, ("%PDF-1.4\n" + body + "\n").encode() + bytes(64))
+        rep = self.scan(cfg)
+        for name in forms:
+            self.assertTrue(any(f.check == "private-term" and f.path == name for f in rep.findings), name)
+
+    def test_data_uri_spellings_and_office_part_names(self):
+        import base64
+        gps_jpeg = jpeg(tiff([(0x010F, "Cam")], gps=[(1, "N")]))
+        std = base64.b64encode(gps_jpeg).decode()
+        url = base64.urlsafe_b64encode(gps_jpeg).decode().rstrip("=")
+        for i, uri in enumerate((f"data:image/jpeg;name=a.jpg;base64,{std}",
+                                 f"data:image/jpeg;charset=binary;base64,{std}",
+                                 f"DATA:image/jpeg;BASE64,{std}",
+                                 f"data:image/jpeg;base64,{url}")):
+            write(self.root, f"docs/u{i}.svg", f'<svg><image href="{uri}"/></svg>\n')
+        rep = self.scan()
+        for i in range(4):
+            self.assertTrue(any(f.check == "gps-location" and f"u{i}.svg" in f.path for f in rep.findings), i)
+        for i in range(4):
+            os.unlink(self.root / f"docs/u{i}.svg")
+        with zipfile.ZipFile(self.root / "deck.pptx", "w") as zf:
+            zf.writestr("[Content_Types].xml", "<Types/>")
+            zf.writestr("ppt/media/image1.xml", gps_jpeg)
+        self.assertTrue(any(f.check == "gps-location" and "deck.pptx" in f.path for f in self.scan().findings))
+
+
 class RunIsolated(unittest.TestCase):
     def setUp(self):
         import tempfile
@@ -332,7 +414,8 @@ class RunIsolated(unittest.TestCase):
             os.environ.pop("GH_TOKEN", None)
         self.assertEqual(code, 3)
         self.assertEqual(set(seen["env"]), {"PATH", "HOME", "SKILL_RELEASE_HOME", "TMPDIR", "LANG",
-                                            "PYTHONDONTWRITEBYTECODE"})
+                                            "PYTHONDONTWRITEBYTECODE", "GIT_CONFIG_NOSYSTEM",
+                                            "GIT_CONFIG_GLOBAL"})
         self.assertTrue(seen["env"]["HOME"].startswith(os.path.realpath(self.tmp)) or
                         seen["env"]["HOME"].startswith(self.tmp))
         self.assertEqual(seen["cwd"], os.path.abspath(self.tmp))

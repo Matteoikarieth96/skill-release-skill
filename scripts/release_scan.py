@@ -880,18 +880,33 @@ def _png_text(key: bytes, val: bytes, where, rep, cfg):
     _terms_in_strings([text], where, rep, cfg)
 
 
-PDF_INFO = re.compile(r"/(Author|Creator|Producer|Title|Subject|Keywords)\s*\(((?:\\.|[^\\)]){0,400})\)", re.S)
+PDF_INFO_KEY = re.compile(r"/(Author|Creator|Producer|Title|Subject|Keywords)\s*([(<])")
+PDF_HEX = re.compile(r"<([0-9A-Fa-f\s]{2,20000})>")
+PDF_STREAM = re.compile(rb"(?<!end)stream\r?\n")
 PDF_ESC = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f", "(": "(", ")": ")", "\\": "\\"}
+PDF_MAX_STRINGS = 200_000
 
 
-def _pdf_literal(value: str) -> str:
-    """Decodes a PDF literal string: backslash escapes, octal codes, UTF-16BE with BOM."""
-    out, i = [], 0
-    while i < len(value):
-        ch = value[i]
-        if ch == "\\" and i + 1 < len(value):
-            nxt = value[i + 1]
-            m = re.match(r"[0-7]{1,3}", value[i + 1:i + 4])
+def _pdf_unicode(raw: str) -> str:
+    if raw.startswith("\xfe\xff"):
+        return raw[2:].encode("latin-1", "replace").decode("utf-16-be", "replace")
+    return raw
+
+
+def _pdf_literal_at(text: str, start: int, limit: int = 100_000):
+    """Parses the literal string whose "(" is at start: nesting, escapes, octal, line
+    continuations. Returns (decoded value, end index)."""
+    out, depth, i, n = [], 1, start + 1, min(len(text), start + 1 + limit)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            if i + 1 >= n:
+                break
+            nxt = text[i + 1]
+            if nxt in "\r\n":
+                i += 2 + (1 if nxt == "\r" and i + 2 < n and text[i + 2] == "\n" else 0)
+                continue
+            m = re.match(r"[0-7]{1,3}", text[i + 1:i + 4])
             if m:
                 out.append(chr(int(m.group(0), 8) & 0xFF))
                 i += 1 + len(m.group(0))
@@ -899,37 +914,55 @@ def _pdf_literal(value: str) -> str:
             out.append(PDF_ESC.get(nxt, nxt))
             i += 2
             continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return _pdf_unicode("".join(out)), i + 1
         out.append(ch)
         i += 1
-    raw = "".join(out)
-    if raw.startswith("\xfe\xff"):
-        return raw[2:].encode("latin-1", "replace").decode("utf-16-be", "replace")
-    return raw
-PDF_INFO_HEX = re.compile(r"/(Author|Creator|Producer|Title|Subject|Keywords)\s*<([0-9A-Fa-f\s]{2,1000})>")
-PDF_STREAM = re.compile(rb"(?<!end)stream\r?\n")
+    return _pdf_unicode("".join(out)), i
 
 
 def _pdf_hex(value: str) -> str:
     hexs = re.sub(r"\s", "", value)
     if len(hexs) % 2:
         hexs += "0"
-    raw = bytes.fromhex(hexs)
-    if raw.startswith(b"\xfe\xff"):
-        return raw[2:].decode("utf-16-be", "replace")
-    return raw.decode("latin-1")
+    return _pdf_unicode(bytes.fromhex(hexs).decode("latin-1"))
+
+
+def pdf_strings(text: str):
+    """Every literal and hex string of a PDF body, decoded."""
+    count, pos = 0, 0
+    while count < PDF_MAX_STRINGS:
+        i = text.find("(", pos)
+        if i == -1:
+            break
+        value, pos = _pdf_literal_at(text, i)
+        count += 1
+        yield value
+    for m in PDF_HEX.finditer(text):
+        if count >= PDF_MAX_STRINGS:
+            break
+        count += 1
+        yield _pdf_hex(m.group(1))
 
 
 def scan_pdf(data, where, rep, cfg):
     text = data.decode("latin-1")
-    for rx, decode in ((PDF_INFO, _pdf_literal), (PDF_INFO_HEX, _pdf_hex)):
-        for m in rx.finditer(text):
-            value = decode(m.group(2))
-            sev = "INFO" if m.group(1) == "Producer" else "WARN"
-            rep.add(sev, "pdf-metadata", where, f"PDF {m.group(1)}: {clean(value, 50)!r}")
-            _terms_in_strings([value], where, rep, cfg)
+    for m in PDF_INFO_KEY.finditer(text):
+        if m.group(2) == "(":
+            value, _end = _pdf_literal_at(text, m.end() - 1, 2000)
+        else:
+            hm = PDF_HEX.match(text, m.end() - 1)
+            value = _pdf_hex(hm.group(1)) if hm else ""
+        sev = "INFO" if m.group(1) == "Producer" else "WARN"
+        rep.add(sev, "pdf-metadata", where, f"PDF {m.group(1)}: {clean(value, 50)!r}")
     if "<x:xmpmeta" in text:
         rep.add("WARN", "pdf-metadata", where, "PDF has an XMP metadata packet")
     _terms_in_strings([text], where, rep, cfg)
+    _terms_in_strings(pdf_strings(text), where, rep, cfg)
     total = 0
     for m in PDF_STREAM.finditer(data):
         stop = data.find(b"endstream", m.end())
@@ -942,7 +975,9 @@ def scan_pdf(data, where, rep, cfg):
         if total > 40_000_000:
             rep.add("WARN", "pdf-metadata", where, "PDF streams only partly scanned (size cap)")
             break
-        scan_text(inflated.decode("latin-1"), where, rep, cfg, origin="pdf stream", leak_only=True)
+        body = inflated.decode("latin-1")
+        scan_text(body, where, rep, cfg, origin="pdf stream", leak_only=True)
+        _terms_in_strings(pdf_strings(body), where, rep, cfg)
 
 
 def scan_video(data, where, rep, cfg):
@@ -976,43 +1011,32 @@ def scan_zip(data, where, rep, cfg, name):
         return
     total = 0
     for info in infos[:5000]:
-        if not info.filename.endswith((".xml", ".rels")):
-            if info.is_dir():
-                continue
-            try:
-                with zf.open(info) as fh:
-                    blob = fh.read(MEDIA_PART_CAP + 1)
-            except Exception:
-                rep.add("WARN", "document-metadata", where,
-                        f"could not read part {clean(info.filename, 40)}: check the document by hand")
-                continue
-            total += len(blob)
-            if total > DOC_TOTAL_CAP:
-                rep.add("WARN", "document-metadata", where, "document only partly scanned (size cap)")
-                break
-            part = f"{where} > {clean(info.filename, 60)}"
-            if blob[:4] == b"PK\x03\x04":
-                rep.add("FAIL", "archive", part, "archive nested inside a document: not scanned")
-            else:
-                scan_media(info.filename, blob[:MEDIA_PART_CAP], part, rep, cfg)
-            scan_text(blob[:MAX_TEXT].decode("latin-1"), part, rep, cfg, leak_only=True, binary=True)
+        if info.is_dir():
             continue
         try:
             with zf.open(info) as fh:
-                raw = fh.read(PART_CAP + 1)
+                raw = fh.read(MEDIA_PART_CAP + 1)
         except Exception:
             rep.add("WARN", "document-metadata", where,
                     f"could not read part {clean(info.filename, 40)}: check the document by hand")
             continue
-        if len(raw) > PART_CAP:
-            rep.add("WARN", "document-metadata", where, f"part {clean(info.filename, 40)} only partly scanned")
-            raw = raw[:PART_CAP]
         total += len(raw)
         if total > DOC_TOTAL_CAP:
             rep.add("WARN", "document-metadata", where, "document only partly scanned (size cap)")
             break
-        xml = raw.decode("utf-8", "replace")
         part = f"{where} > {clean(info.filename, 60)}"
+        if raw.lstrip(b"\xef\xbb\xbf \t\r\n")[:1] != b"<":
+            # Not XML, whatever its name says: images and other media go through the media checks.
+            if raw[:4] == b"PK\x03\x04":
+                rep.add("FAIL", "archive", part, "archive nested inside a document: not scanned")
+            else:
+                scan_media(info.filename, raw[:MEDIA_PART_CAP], part, rep, cfg)
+            scan_text(raw[:MAX_TEXT].decode("latin-1"), part, rep, cfg, leak_only=True, binary=True)
+            continue
+        if len(raw) > PART_CAP:
+            rep.add("WARN", "document-metadata", where, f"part {clean(info.filename, 40)} only partly scanned")
+            raw = raw[:PART_CAP]
+        xml = raw.decode("utf-8", "replace")
         if info.filename in ("docProps/core.xml", "docProps/app.xml", "meta.xml"):
             for tag in ("dc:creator", "cp:lastModifiedBy", "Company", "Manager", "meta:initial-creator"):
                 m = re.search(rf"<{tag}>([^<]{{1,200}})</{tag}>", xml)
@@ -1164,21 +1188,28 @@ def is_binary(data: bytes) -> bool:
 
 TEXT_EXT = CODE_EXT | {".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
                        ".csv", ".tsv", ".xml", ".svg", ".css", ".rst", ".env", ".envrc", ".properties",
-                       ".jsonl", ".ipynb"}
+                       ".jsonl", ".ipynb", ".markdown", ".mdx", ".mdown", ".adoc", ".org", ".tex",
+                       ".rtf", ".html", ".htm", ".yml", ".lock", ".tpl", ".j2", ".jinja", ""}
+MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".pdf", ".mp4", ".mov", ".m4v", ".m4a", ".heic", ".heif",
+              ".gif", ".webp", ".tif", ".tiff", ".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".pptm",
+              ".odt", ".ods", ".odp", ".zip", ".avif", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
+              ".tar", ".whl", ".jar", ".epub"}
 TEXT_NAMES = {"license", "licence", "readme", "makefile", "dockerfile", "copying", "notice", "authors",
               "changelog", "procfile", "gemfile", ".gitignore", ".gitattributes", ".envrc", ".env",
               ".npmrc", ".editorconfig", ".gitleaksignore"}
-DATA_URI = re.compile(r"data:(?:image|application)/[A-Za-z0-9.+-]{1,30};base64,([A-Za-z0-9+/=\s]{40,22000000})")
+DATA_URI = re.compile(r"(?i)data:[^,;\s]{0,60}(?:;[^,;\s]{1,60}){0,6};base64,([A-Za-z0-9+/=_\-\s]{40,22000000})")
 
 
 def scan_bytes(rel: str, data: bytes, rep: Report, cfg, origin: str = "", full: bool = True):
     where = f"{rel} ({origin})" if origin else rel
     base = rel.rsplit("/", 1)[-1].lower()
     ext = os.path.splitext(base)[1]
-    texty = ext in TEXT_EXT or base in TEXT_NAMES
     recognised = scan_media(rel, data[:MAX_MEDIA], where, rep, cfg)
-    if recognised and texty:
-        rep.add("FAIL", "type-mismatch", where, "a text-named file holds a binary format: rename or remove it")
+    mismatch = recognised and ext not in MEDIA_EXTS
+    texty = ext in TEXT_EXT or base in TEXT_NAMES or mismatch
+    if mismatch:
+        rep.add("FAIL", "type-mismatch", where,
+                "a media or archive format under a non-media name: rename or remove it")
     text, enc = decode_text(data[:MAX_TEXT])
     if text is None and texty:
         # A file named as text is always read as text, whatever its first bytes say.
@@ -1200,7 +1231,8 @@ def scan_bytes(rel: str, data: bytes, rep: Report, cfg, origin: str = "", full: 
             rep.add("WARN", "data-uri", where, "more than 50 embedded data URIs: the rest were not inspected")
             break
         try:
-            blob = base64.b64decode(re.sub(r"\s", "", m.group(1)), validate=False)
+            b64 = re.sub(r"\s", "", m.group(1)).replace("-", "+").replace("_", "/")
+            blob = base64.b64decode(b64 + "=" * (-len(b64) % 4), validate=False)
         except (ValueError, binascii.Error):
             continue
         sub_where = f"{where} > data URI"
@@ -1281,6 +1313,13 @@ def git_config_problem(root: Path):
     for extra in ("config.worktree", "commondir"):
         if os.path.lexists(gd / extra):
             return f".git/{extra} is present"
+    hooks = gd / "hooks"
+    if os.path.lexists(hooks):
+        if not stat.S_ISDIR(os.lstat(hooks).st_mode):
+            return ".git/hooks is not a plain folder"
+        live = sorted(h for h in os.listdir(hooks) if not h.endswith(".sample"))
+        if live:
+            return f".git/hooks holds {clean(', '.join(live), 60)}: hooks run at your next commit or push"
     cfgf = gd / "config"
     if not os.path.lexists(cfgf):
         return None
@@ -1428,10 +1467,10 @@ def scan_history(root: Path, rep: Report, cfg, current_shas: set, current_names=
     if skipped:
         rep.add("WARN", "history-partial", ".", f"{skipped} large blobs in the history were not scanned")
     # Every path that ever existed, also renamed or deleted ones whose content is still current.
-    log = git(root, "log", "--all", "--no-renames", "--name-only", "-z", "--format=")
+    log = git(root, "log", "--all", "-m", "--no-renames", "--name-only", "-z", "--format=")
     seen_names = set(current_names)
-    for entry in log.stdout.split(b"\0"):
-        name = entry.strip(b"\n").decode("utf-8", "replace")
+    historic = [e.strip(b"\n").decode("utf-8", "replace") for e in log.stdout.split(b"\0")]
+    for name in historic + sorted(set(paths.values())):
         if name and name not in seen_names:
             seen_names.add(name)
             check_name(name, rep, f"{name} (history)", cfg)

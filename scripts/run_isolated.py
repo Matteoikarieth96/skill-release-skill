@@ -40,7 +40,7 @@ def clean_env(scratch: str) -> dict:
         "PYTHONDONTWRITEBYTECODE": "1",
         # git inside the command reads neither the system nor your global config.
         "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.path.join(scratch, "home", ".gitconfig"),
     }
 
 
@@ -53,6 +53,7 @@ def run(scratch, command, cwd=None, timeout=1800, runner=subprocess.run, out=pri
         os.makedirs(env[key], exist_ok=True)
     cwd = os.path.abspath(cwd) if cwd else scratch
     out(f"isolated: {shlex.join(command)}  (cwd {cwd}, HOME {env['HOME']})")
+    sys.stdout.flush()
     try:
         return runner(command, cwd=cwd, env=env, timeout=timeout).returncode
     except subprocess.TimeoutExpired:

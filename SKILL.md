@@ -234,7 +234,10 @@ the release where `local.md` says (for example a memory note).
 
 ## Updating a skill that is already public
 
-Every push to a public skill repo: run the scan and the tests, gitleaks
-included, and grep the diff for private terms. Changes to scripts or to what
-the skill tells Claude to do get one security reviewer on the diff. Push only
-with the owner's yes, then run `repo_settings.py check ... --stage public`.
+Every push to a public skill repo, in this order: run the tests on a fresh
+throwaway copy through `run_isolated.py` (as in Step 4, never in the repo
+itself), grep the diff for private terms, then run the scan, gitleaks
+included, as the last step right before the push (it refuses live git hooks).
+Changes to scripts or to what the skill tells Claude to do get one security
+reviewer on the diff. Push only with the owner's yes, then run
+`repo_settings.py check ... --stage public`.

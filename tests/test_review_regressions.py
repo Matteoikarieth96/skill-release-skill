@@ -344,8 +344,15 @@ class FinalReviewFixes(Base):
         write(self.root, "clients/Zorblatt-notes.md", "x\n")
         git(self.root, "add", "-A")
         git(self.root, "commit", "-q", "-m", "merge")
+        # Remove it in a second merge too, so only merge commits ever show the path.
+        git(self.root, "checkout", "-q", "side")
+        write(self.root, "side2.md", "side2\n")
+        self.commit("side2")
+        git(self.root, "checkout", "-q", "main")
+        git(self.root, "merge", "-q", "--no-commit", "side")
         os.unlink(self.root / "clients/Zorblatt-notes.md")
-        self.commit("remove")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "merge2")
         hits = [f.path for f in self.scan(cfg).findings if f.check == "private-term"]
         self.assertTrue(any("Zorblatt-notes" in h for h in hits), hits)
 
@@ -363,6 +370,19 @@ class FinalReviewFixes(Base):
         rep = self.scan(cfg)
         for name in forms:
             self.assertTrue(any(f.check == "private-term" and f.path == name for f in rep.findings), name)
+
+    def test_pdf_author_after_many_strings(self):
+        cfg = self.terms("Zorblatt")
+        author = "Zorblatt".encode("utf-16-be").hex()
+        body = "()" * 200001 + "/Author <FEFF" + author + ">"
+        write(self.root, "big.pdf", ("%PDF-1.4\n" + body + "\n").encode() + bytes(64))
+        rep = self.scan(cfg)
+        self.assertTrue(any(f.check == "private-term" and f.path == "big.pdf" for f in rep.findings))
+
+    def test_office_template_is_not_a_mismatch(self):
+        with zipfile.ZipFile(self.root / "t.potx", "w") as zf:
+            zf.writestr("[Content_Types].xml", "<Types/>")
+        self.assertNotIn("type-mismatch", self.checks(self.scan(), "FAIL"))
 
     def test_data_uri_spellings_and_office_part_names(self):
         import base64

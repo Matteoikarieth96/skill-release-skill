@@ -111,7 +111,7 @@ The scanner also works alone:
 python3 ~/.claude/skills/skill-release/scripts/release_scan.py scan path/to/staging
 python3 ~/.claude/skills/skill-release/scripts/release_scan.py strip path/to/staging/docs/hero.jpg
 python3 ~/.claude/skills/skill-release/scripts/repo_settings.py check OWNER/REPO --stage public
-python3 ~/.claude/skills/skill-release/scripts/run_isolated.py /tmp/scratch --cwd path/to/staging -- python3 -m unittest discover -s tests
+cp -R path/to/staging /tmp/scratch/t && python3 ~/.claude/skills/skill-release/scripts/run_isolated.py /tmp/scratch --cwd /tmp/scratch/t -- python3 -m unittest discover -s tests
 ```
 
 `scan` exits 1 on any FAIL (`--strict` also on WARN), `--json` for machine

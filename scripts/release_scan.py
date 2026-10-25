@@ -959,10 +959,14 @@ def scan_pdf(data, where, rep, cfg):
             value = _pdf_hex(hm.group(1)) if hm else ""
         sev = "INFO" if m.group(1) == "Producer" else "WARN"
         rep.add(sev, "pdf-metadata", where, f"PDF {m.group(1)}: {clean(value, 50)!r}")
+        _terms_in_strings([value], where, rep, cfg)
     if "<x:xmpmeta" in text:
         rep.add("WARN", "pdf-metadata", where, "PDF has an XMP metadata packet")
     _terms_in_strings([text], where, rep, cfg)
-    _terms_in_strings(pdf_strings(text), where, rep, cfg)
+    strings = list(pdf_strings(text))
+    if len(strings) >= PDF_MAX_STRINGS:
+        rep.add("WARN", "pdf-metadata", where, f"PDF with more than {PDF_MAX_STRINGS} strings: only partly searched")
+    _terms_in_strings(strings, where, rep, cfg)
     total = 0
     for m in PDF_STREAM.finditer(data):
         stop = data.find(b"endstream", m.end())
@@ -1193,7 +1197,9 @@ TEXT_EXT = CODE_EXT | {".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini",
 MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".pdf", ".mp4", ".mov", ".m4v", ".m4a", ".heic", ".heif",
               ".gif", ".webp", ".tif", ".tiff", ".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".pptm",
               ".odt", ".ods", ".odp", ".zip", ".avif", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
-              ".tar", ".whl", ".jar", ".epub"}
+              ".tar", ".whl", ".jar", ".epub", ".potx", ".dotx", ".xltx", ".ppsx", ".ppsm", ".potm",
+              ".dotm", ".xltm", ".xlsb", ".odg", ".odf", ".ott", ".ots", ".otp", ".jfif", ".ai",
+              ".dng", ".3gp", ".3g2", ".m4b", ".tgz"}
 TEXT_NAMES = {"license", "licence", "readme", "makefile", "dockerfile", "copying", "notice", "authors",
               "changelog", "procfile", "gemfile", ".gitignore", ".gitattributes", ".envrc", ".env",
               ".npmrc", ".editorconfig", ".gitleaksignore"}

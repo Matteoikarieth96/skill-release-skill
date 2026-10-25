@@ -126,6 +126,9 @@ Read [references/review.md](references/review.md). Depth from the intake:
 - **Complete + benchmark**: Complete, plus with-and-without-skill evals using
   the skill-creator skill when it is available.
 
+Without an Agent tool, run each prompt yourself, one at a time, and write in
+the report that the review was not independent.
+
 Then verify every finding yourself (re-run the proof). Real: fix it and add a
 regression test. Not real: write why. Re-run step 4. When the fixes are more
 than a few lines, one more reviewer looks at the diff. Everything goes in the
@@ -146,6 +149,11 @@ Finish the report: what the skill does, what was removed or rewritten, every
 finding with its fix, residual risks, open items, the private repo link. Show
 the owner a short summary first, then ask with `AskUserQuestion`: "Go public
 now" / "Not yet". Anything but a clear yes stops here.
+
+If the owner's own request already said to publish (for example "publish it on
+GitHub"), that is the yes, but only for a clean result: every gate green, no
+Critical or High finding left open, nothing the owner has not seen that
+changes what goes public. Record their words in the report. Otherwise ask.
 
 ## Step 8: go public (only after the yes)
 

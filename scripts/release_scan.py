@@ -128,7 +128,10 @@ def load_config(path=None) -> dict:
     cfg_path = Path(path).expanduser() if path else local_home() / "config.json"
     source = ""
     if cfg_path.is_file():
-        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            raise SystemExit(f"config is not valid JSON: {cfg_path}: {exc}")
         if not isinstance(data, dict):
             raise SystemExit(f"config must be a JSON object: {cfg_path}")
         cfg.update(data)
@@ -234,7 +237,8 @@ PRIVATE_IP = re.compile(
     r"(?<![\d.])(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}"
     r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(?![\d.])")
 MAC_ADDR = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")
-HOME_PATH = re.compile(r"(?:/Users/|/home/)([A-Za-z0-9._-]{1,64})")
+# A root-level /Users/<name> or /home/<name>, not a subfolder called "home".
+HOME_PATH = re.compile(r"(?<![\w}\]).~-])(?:/Users/|/home/)([A-Za-z0-9_][A-Za-z0-9._-]{0,63})")
 WIN_HOME = re.compile(r"[A-Za-z]:\\+Users\\+([A-Za-z0-9._-]{1,64})")
 PLACEHOLDER_USERS = {"shared", "you", "user", "username", "name", "me", "runner", "example",
                      "yourname", "your-name", "your_name", "alice", "bob", "someone", "jdoe"}
@@ -243,6 +247,8 @@ AUTHOR_MACHINE = re.compile(
 USB_SERIAL = re.compile(
     r"/dev/(?:cu|tty)\.(?:usbmodem|usbserial|SLAB_USBtoUART|wchusbserial)[-_]?([A-Za-z0-9]{4,})")
 LOCAL_HOST = re.compile(r"(?<![.\w-])([A-Za-z0-9-]{3,63})\.local\b(?!\.[A-Za-z])")
+CURL_PIPE_SHELL = re.compile(r"(?:curl|wget)[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b")
+PLACEHOLDER_LEFT = re.compile(r"\{\{[A-Z][A-Z0-9_]*\}\}")
 HIDDEN_CHARS = re.compile("[\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff"
                           "\U000e0000-\U000e007f]")
 HTML_COMMENT = re.compile(r"<!--(.*?)-->", re.S)
@@ -262,8 +268,6 @@ CODE_RULES = [
      "yaml.load without SafeLoader"),
     ("WARN", "bind-all", re.compile(r"0\.0\.0\.0"),
      "all-interfaces address: a local server bound there is reachable from the whole network"),
-    ("WARN", "curl-pipe-shell", re.compile(r"(?:curl|wget)[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b"),
-     "download piped into a shell"),
     ("WARN", "chmod-777", re.compile(r"chmod\s+(?:-R\s+)?0?777"), "world-writable permissions"),
     # Some words are split so that this file does not match its own rules.
     ("WARN", "tls-off", re.compile(
@@ -451,6 +455,10 @@ def scan_text(text: str, path: str, rep: Report, cfg, *, ext: str = "", origin: 
                 line_of(text, m.start()))
     if not full:
         return
+    for m in CURL_PIPE_SHELL.finditer(text):
+        rep.add("WARN", "curl-pipe-shell", where,
+                "download piped into a shell: never run it on the reviewer's machine",
+                line_of(text, m.start()))
     if ext == ".md":
         for m in HTML_COMMENT.finditer(text):
             rep.add("INFO", "hidden-comment", where,
@@ -802,10 +810,17 @@ MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".pdf", ".mp4", ".mov", ".m4v", ".m4a", "
               ".odp", ".zip", ".avif"}
 
 
+AGENT_CONFIG = re.compile(r"(?:^|/)(?:\.claude/settings(?:\.local)?\.json|hooks/hooks\.json|\.mcp\.json)$")
+
+
 def check_name(rel: str, rep: Report, where: str):
     base = rel.rsplit("/", 1)[-1]
     parts = rel.split("/")[:-1]
-    if base not in SENSITIVE_OK and any(fnmatch.fnmatch(base, p) for p in SENSITIVE_FAIL):
+    if AGENT_CONFIG.search(rel):
+        rep.add("FAIL", "agent-config", where,
+                "Claude Code settings, hooks or MCP config: they grant permissions or run "
+                "commands on every user's machine; a skill does not ship them")
+    elif base not in SENSITIVE_OK and any(fnmatch.fnmatch(base, p) for p in SENSITIVE_FAIL):
         rep.add("FAIL", "sensitive-file", where, f"file type that usually holds secrets: {base}")
     elif any(fnmatch.fnmatch(base, p) for p in JUNK_WARN):
         rep.add("WARN", "junk-file", where, f"should not be published: {base}")
@@ -1111,6 +1126,15 @@ def check_skill(root: Path, rep: Report, cfg):
         rep.add("FAIL", "skill-md", "SKILL.md", "no YAML frontmatter (--- name / description ---)")
         return
     name, desc = fields.get("name", ""), fields.get("description", "")
+    for key in fields:
+        if key == "hooks":
+            rep.add("FAIL", "skill-frontmatter", "SKILL.md",
+                    "frontmatter 'hooks' runs commands for every user who installs the skill")
+        elif key == "allowed-tools":
+            rep.add("WARN", "skill-frontmatter", "SKILL.md",
+                    f"frontmatter 'allowed-tools' pre-approves tools for every user: {clean(fields[key], 60)!r}")
+        elif key not in ("name", "description", "license"):
+            rep.add("WARN", "skill-frontmatter", "SKILL.md", f"frontmatter key {clean(key, 30)!r}: read what it does")
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name or "") or len(name) > 64:
         rep.add("FAIL", "skill-md", "SKILL.md", f"name must be lowercase-with-hyphens, max 64: {clean(name, 40)!r}")
     elif re.search(r"anthropic|claude", name):
@@ -1159,6 +1183,15 @@ def check_links(root: Path, rep: Report, files):
 
 def check_repo_files(root: Path, rep: Report, cfg, files):
     names = {rel for rel, _ in files}
+    for doc in sorted(n for n in names if "/" not in n and re.match(
+            r"^(?:README|SECURITY|SKILL|LICEN[CS]E|CONTRIBUTING)(?:\.md|\.txt)?$", n)):
+        full = root / doc
+        if full.is_symlink() or not full.is_file():
+            continue
+        text = full.read_text(encoding="utf-8", errors="replace")[:MAX_TEXT]
+        for m in PLACEHOLDER_LEFT.finditer(text):
+            rep.add("FAIL", "placeholder", doc, f"template placeholder left: {m.group(0)}",
+                    line_of(text, m.start()))
     lic = next((n for n in ("LICENSE", "LICENSE.md", "LICENSE.txt", "LICENCE") if n in names), None)
     if not lic:
         rep.add("FAIL", "license", ".", "no LICENSE file")
@@ -1242,10 +1275,14 @@ def scan(root: Path, cfg, *, history=True, gitleaks=True) -> Report:
         rep.add("WARN", "git", ".", f"folder is inside another repo ({clean(top, 60)}): history not scanned; stage it in its own folder")
     elif top is None:
         rep.add("INFO", "git", ".", "not a git repo yet: history checks skipped")
+    n_terms = len(cfg["_terms"])
     if cfg.get("_source"):
-        rep.add("INFO", "config", ".", f"owner config {cfg['_source']}, {len(cfg['_terms'])} private terms")
+        rep.add("INFO", "config", ".", f"owner config {cfg['_source']}, {n_terms} private terms")
     else:
-        rep.add("INFO", "config", ".", "no owner config: private-term and identity checks off")
+        rep.add("WARN", "config", ".", "no owner config.json: commit identities are not checked")
+    if not n_terms:
+        rep.add("WARN", "config", ".", "no private terms loaded: names of people, clients and "
+                "private projects are not checked (see README, private settings)")
     files = list_files(root, use_git, Report())
     shas = scan_tree(root, use_git, rep, cfg)
     check_skill(root, rep, cfg)

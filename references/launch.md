@@ -6,15 +6,17 @@ needs the owner's yes before it happens.
 ## README cross-links
 
 1. List the owner's other public skill repos:
-   `gh repo list OWNER --visibility public --limit 100 --json name,description`
+   `gh repo list "OWNER" --visibility public --source --no-archived --limit 100 --json name,description`
    and keep the ones that are skills (a SKILL.md at the root).
-2. In each local clone, add the new skill to the "More skills" list, same
-   format as the existing lines: `- [name](https://github.com/OWNER/REPO): one line`.
-   Add the other skills to the new repo's README too.
+2. In each local clone: `git pull --ff-only`, then `git status --short` must
+   be empty (otherwise leave that repo and tell the owner). Add the new skill
+   to the "More skills" list, same format as the existing lines:
+   `- [name](https://github.com/OWNER/REPO): one line`. Add the other skills to
+   the new repo's README too.
 3. Show the owner the list of repos and the one-line diff, ask once for the
    whole batch.
-4. For each repo: tests, `release_scan.py scan`, commit, push; then
-   `repo_settings.py check OWNER/REPO --stage public`.
+4. For each repo: tests, `release_scan.py scan`, `git add README.md` (that file
+   only), commit, push; then `repo_settings.py check "OWNER/REPO" --stage public`.
 
 ## X post draft
 

@@ -22,6 +22,9 @@ to every file, image, commit message and to the README.
 - **Fictional means fictional**: invented names that do not belong to a real
   company or person (search the name once), reserved domains `example.com`,
   `.example`, `.test`, numbers marked as examples.
+- **Private terms** match whole words, case-insensitive, but not other
+  spellings: list `Acme Rossi`, `acme-rossi`, `acme_rossi` and the domain
+  separately.
 
 ## 2. Other people's work
 

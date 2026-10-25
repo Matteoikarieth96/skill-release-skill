@@ -8,7 +8,9 @@ defaults below and say which ones you used.
 
 1. **Which skill and which repo name.** Path of the skill folder. Repo name
    default: `<skill-name>-skill` under the configured owner. Check the name is
-   free: `gh repo view OWNER/NAME` must fail.
+   free: `gh auth status` first (logged in as the owner), then
+   `gh repo view "OWNER/NAME"` must fail with "Could not resolve". Both names
+   must match `^[a-z0-9]+(-[a-z0-9]+)*$` before they go into any path.
 2. **What inside is not public.** Offer the likely categories you saw while
    reading the folder, multi-select: people and clients, an employer or a
    project of others, other private repos, code or text written by someone
@@ -17,8 +19,9 @@ defaults below and say which ones you used.
    line in the report inventory and, for names, a private term.
 3. **Review depth.**
    - Complete (Recommended): automated gate, 2 to 4 security reviewers, a
-     privacy and IP reviewer, a cold-start tester. Roughly 30 to 60 minutes.
-   - Light: automated gate and one reviewer. Roughly 10 to 15 minutes.
+     privacy and IP reviewer, a cold-start tester: 4 to 6 agents, so it costs
+     usage. Very rough time: half an hour to an hour.
+   - Light: automated gate and one reviewer. Very rough time: 10 to 20 minutes.
    - Complete + benchmark: Complete plus with-and-without-skill evals.
 4. **Launch extras**, multi-select: links in the README of the other public
    skills, an X post draft with infographic, a 9:16 short, nothing.

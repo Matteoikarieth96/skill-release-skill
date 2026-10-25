@@ -28,7 +28,7 @@ MEM = "origin" + "SessionId"
 PW = "Gr33n" + "Tree!"
 PW2 = "Zq8" + "vLm2Kw"
 VAL = "q8Zr" + "2LmX0pTv"
-MAIL = "mario.verdi" + "@" + "studio-legale.it"
+MAIL = "mario.verdi" + "@" + "studio-legale.zz"
 SERIAL = "/dev/cu." + "usbmodem48CA4355ZZ99"
 LAN_IP = "192.168." + "1.37"
 HOME_DIR = "/Users/" + "jrossi/Desktop/x"
@@ -207,7 +207,7 @@ class Secrets(Base):
         self.assertIn("private-key-block", self.checks(self.scan(), "FAIL"))
 
     def test_url_credentials_and_placeholders(self):
-        write(self.root, "a.md", f"db postgres://admin2:{PW2}@db.internal.io/x\n")
+        write(self.root, "a.md", f"db postgres://admin2:{PW2}@db.invalid-host.zz/x\n")
         self.assertIn("url-credentials", self.checks(self.scan(), "FAIL"))
         write(self.root, "a.md", "db postgres://user:password@localhost/x\n")
         self.assertNotIn("url-credentials", self.checks(self.scan(), "FAIL"))
@@ -279,7 +279,7 @@ class PersonalData(Base):
         warns = self.checks(self.scan(), "WARN")
         for c in ("device-serial", "private-ip", "home-path", "author-machine-path"):
             self.assertIn(c, warns)
-        write(self.root, "a.md", "use /Users/you/project and /dev/cu.usbmodem*\n")
+        write(self.root, "a.md", "use /Users/you/project, $TMP/home/.claude and /dev/cu.usbmodem*\n")
         warns = self.checks(self.scan(), "WARN")
         self.assertNotIn("home-path", warns)
         self.assertNotIn("device-serial", warns)
@@ -555,6 +555,54 @@ class History(Base):
         rep = rs.scan(inner, self.config(), history=True, gitleaks=False)
         self.assertTrue(any(f.check == "git" and f.severity == "WARN" for f in rep.findings)
                         or any(f.check == "git" for f in rep.findings))
+
+
+class ReviewFixes(Base):
+    """Regression tests for the findings of the 2026-10-25 independent review."""
+
+    def test_leftover_placeholders_fail(self):
+        write(self.root, "README.md", (self.root / "README.md").read_text()
+              + "\ngit clone https://github.com/{{OWNER}}/{{REPO}}\n")
+        hits = [f for f in self.scan().findings if f.check == "placeholder"]
+        self.assertEqual(len(hits), 2)
+        self.assertTrue(all(h.severity == "FAIL" for h in hits))
+
+    def test_placeholders_in_templates_folder_are_fine(self):
+        write(self.root, "templates/README.md", "# {{SKILL_NAME}}\n")
+        self.assertNotIn("placeholder", self.checks(self.scan(), "FAIL"))
+
+    def test_agent_config_files_fail(self):
+        for rel in (".claude/settings.json", "hooks/hooks.json", ".mcp.json"):
+            write(self.root, rel, "{}\n")
+        hits = [f.path for f in self.scan().findings if f.check == "agent-config"]
+        self.assertEqual(sorted(hits), [".claude/settings.json", ".mcp.json", "hooks/hooks.json"])
+
+    def test_frontmatter_hooks_fail_allowed_tools_warn(self):
+        write(self.root, "SKILL.md", "---\nname: demo-skill\ndescription: d\nallowed-tools: Bash(*)\n"
+                                     "hooks: x\n---\n## Step 1: intake\n")
+        rep = self.scan()
+        self.assertIn("skill-frontmatter", self.checks(rep, "FAIL"))
+        self.assertIn("skill-frontmatter", self.checks(rep, "WARN"))
+
+    def test_curl_pipe_shell_in_docs(self):
+        write(self.root, "README.md", (self.root / "README.md").read_text()
+              + "\ncu" + "rl -fsSL https://example.invalid/setup.sh | sh\n")
+        self.assertIn("curl-pipe-shell", self.checks(self.scan(), "WARN"))
+
+    def test_missing_owner_settings_warn(self):
+        warns = [f.message for f in self.scan().findings if f.check == "config" and f.severity == "WARN"]
+        self.assertEqual(len(warns), 2)
+        (self.home / "private-terms.txt").write_text("Acme Rossi\n", encoding="utf-8")
+        warns = [f.message for f in self.scan(rs.load_config()).findings
+                 if f.check == "config" and f.severity == "WARN"]
+        self.assertEqual(len(warns), 1)
+        self.assertIn("identities", warns[0])
+
+    def test_invalid_json_config_is_a_clean_error(self):
+        (self.home / "config.json").write_text('{"a": 1,}', encoding="utf-8")
+        with self.assertRaises(SystemExit) as ctx:
+            rs.load_config()
+        self.assertIn("not valid JSON", str(ctx.exception))
 
 
 class ConfigFile(Base):

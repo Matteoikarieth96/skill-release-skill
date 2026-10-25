@@ -4,6 +4,7 @@
 Usage:
   repo_settings.py check OWNER/REPO --stage private|public
   repo_settings.py apply OWNER/REPO --stage private|public
+  repo_settings.py post-publish [--config FILE]
 
 Stage "private" (while the repo is still private):
   visibility private, wiki off, Actions token read-only and unable to approve
@@ -11,7 +12,12 @@ Stage "private" (while the repo is still private):
 Stage "public" (right after the switch to public), all of the above plus:
   visibility public, secret scanning and push protection on, private
   vulnerability reporting on, the default branch protected against deletion
-  and force pushes (a ruleset, or an existing classic rule that does the same).
+  and force pushes (a ruleset with no bypass, or an existing classic rule that
+  does the same and also applies to admins).
+
+post-publish runs the owner's `post_publish_commands` from config.json
+($SKILL_RELEASE_HOME, default ~/.claude/skill-release): each command is a list
+of arguments, `~` is expanded, no shell is used, each one is printed first.
 
 The script never changes visibility: going public is a separate, explicit
 command that the owner approves (see references/github.md).
@@ -24,6 +30,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -176,7 +183,9 @@ def check_branch(repo, stage):
         prot = json.loads(out or "{}")
         if not (prot.get("allow_force_pushes") or {}).get("enabled") and not (
                 prot.get("allow_deletions") or {}).get("enabled"):
-            return True, f"{branch} protected by a classic rule"
+            if (prot.get("enforce_admins") or {}).get("enabled"):
+                return True, f"{branch} protected by a classic rule that applies to admins"
+            return False, f"{branch} has a classic rule that admins bypass (turn on 'Do not allow bypassing')"
     return False, f"{branch} can be deleted or force pushed"
 
 
@@ -237,12 +246,60 @@ def run(full_name, stage, apply, gh=run_gh, out=print):
     return 1 if failed else 0
 
 
+def config_path():
+    env = os.environ.get("SKILL_RELEASE_HOME")
+    home = os.path.expanduser(env) if env else os.path.join(os.path.expanduser("~"), ".claude", "skill-release")
+    return os.path.join(home, "config.json")
+
+
+def post_publish(path=None, runner=subprocess.run, out=print):
+    """Runs the owner's post_publish_commands without a shell. Returns the exit code."""
+    path = path or config_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except FileNotFoundError:
+        out(f"no config at {path}: nothing to run")
+        return 0
+    except ValueError as exc:
+        out(f"ERROR    config is not valid JSON: {path}: {exc}")
+        return 1
+    cmds = cfg.get("post_publish_commands", []) if isinstance(cfg, dict) else None
+    if not isinstance(cmds, list) or not all(
+            isinstance(c, list) and c and all(isinstance(a, str) for a in c) for c in cmds):
+        out("ERROR    post_publish_commands must be a list of non-empty lists of strings")
+        return 1
+    if not cmds:
+        out("no post_publish_commands configured")
+        return 0
+    failed = 0
+    for cmd in cmds:
+        argv = [os.path.expanduser(a) for a in cmd]
+        out("RUN      " + shlex.join(argv))
+        try:
+            res = runner(argv, timeout=900)
+            code = res.returncode
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            out(f"FAILED   {exc}")
+            failed += 1
+            continue
+        out(("OK       " if code == 0 else f"FAILED   exit {code}: ") + argv[0])
+        failed += 1 if code else 0
+    return 1 if failed else 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="repo_settings.py", description=__doc__.split("\n")[0])
-    ap.add_argument("action", choices=("check", "apply"))
-    ap.add_argument("repo", help="OWNER/REPO")
-    ap.add_argument("--stage", choices=("private", "public"), required=True)
+    sub = ap.add_subparsers(dest="action", required=True)
+    for name in ("check", "apply"):
+        sp = sub.add_parser(name)
+        sp.add_argument("repo", help="OWNER/REPO")
+        sp.add_argument("--stage", choices=("private", "public"), required=True)
+    pp = sub.add_parser("post-publish", help="run the owner's post_publish_commands")
+    pp.add_argument("--config", help="config.json (default $SKILL_RELEASE_HOME/config.json)")
     args = ap.parse_args(argv)
+    if args.action == "post-publish":
+        return post_publish(args.config)
     return run(args.repo, args.stage, args.action == "apply")
 
 

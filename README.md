@@ -5,7 +5,11 @@ A Claude Code skill that takes one of your skills from a private folder to a
 something that only works on your machine.
 
 It is built around one rule: **nothing becomes public until every check is
-green and you say yes.**
+green and you say yes** to the go / no-go question, after reading the release
+report. Asking it to "publish" starts the process; it is not that yes.
+
+> **Independent project.** Not affiliated with or endorsed by Anthropic,
+> GitHub or the gitleaks project.
 
 ## What it does
 
@@ -23,12 +27,13 @@ green and you say yes.**
    invisible Unicode that can hide instructions, symlinks leaving the repo,
    unpinned CI actions, SKILL.md limits, licence and README checks, plus
    gitleaks when installed.
-5. **Sends it to independent reviewers**: fresh agents that never saw your
-   work, in parallel. Security reviewers try real exploits per attack surface
+5. **Sends it to independent reviewers**: 4 to 6 fresh agents that never saw
+   your work, in parallel (this costs time and usage; a Light mode uses one). Security reviewers try real exploits per attack surface
    (inputs, generated output, commands and network, and the SKILL.md prompt
    itself); a content reviewer checks privacy, licences, brands and claims;
-   a cold-start tester installs the skill from a clone with an empty `HOME`
-   and uses it like a stranger. Every finding is reproduced before it is
+   a cold-start tester installs the skill from a clone with a scratch `HOME`
+   and uses it like a stranger. Code from the reviewed skill only ever runs
+   with a scratch `HOME`, never with your settings or your `gh` login. Every finding is reproduced before it is
    fixed, and gets a regression test.
 6. **Creates the repo private**, applies the private-stage settings, waits for
    CI, and re-scans a fresh clone from GitHub.
@@ -37,8 +42,11 @@ green and you say yes.**
    push protection, private vulnerability reporting, default branch
    protection (no deletion, no force push), wiki off, read-only Actions token,
    Dependabot alerts, and checks an anonymous clone.
-9. Optional launch extras: links in the README of your other skills, an X post
-   draft, a short video brief. Drafts only: nothing is posted for you.
+9. **Installs** the released skill from its permanent clone (replacing an
+   installed one only if you say so, with a dated backup).
+10. Optional launch extras: links in the README of your other skills (pushed
+   only after you approve the list), an X post draft, a short video brief.
+   Drafts only: nothing is posted for you.
 
 ## Install
 
@@ -48,23 +56,45 @@ git clone https://github.com/Matteoikarieth96/skill-release-skill ~/.claude/skil
 
 Requirements:
 
-- Python 3.9 or newer (standard library only).
-- `git`, and the GitHub CLI `gh` logged in to your account for steps 6 to 10.
+- Python 3.9 or newer (standard library only). Tested on macOS and Linux.
+- `git` 2.28 or newer (for `git init -b`) and `rsync`.
+- The GitHub CLI `gh`, logged in to your account (the intake already checks the
+  repo name with it), recent enough to have
+  `gh repo edit --accept-visibility-change-consequences`.
 - [gitleaks](https://github.com/gitleaks/gitleaks) strongly recommended; the
   built-in secret rules are a subset.
 
 ## Your private settings
 
 Personal settings live outside any repo, in `~/.claude/skill-release/`
-(or `$SKILL_RELEASE_HOME`):
+(or `$SKILL_RELEASE_HOME`). Create them once:
 
-- `config.json`: your GitHub owner, copyright holder, allowed commit
-  identities, banned text, folders, commands to run after publishing. Start
-  from [templates/config.example.json](templates/config.example.json).
+```bash
+mkdir -p ~/.claude/skill-release
+cp ~/.claude/skills/skill-release/templates/config.example.json ~/.claude/skill-release/config.json
+touch ~/.claude/skill-release/private-terms.txt
+```
+
+- `config.json`:
+  - `github_owner`, `copyright_holder`: your GitHub name.
+  - `author_identities`: the exact `Name <email>` your commits may carry; any
+    other identity in the history is a FAIL. Edit the example line: for
+    GitHub's private address use `<id>+<name>@users.noreply.github.com`, where
+    `gh api user --jq .id` prints your numeric id.
+  - `allowed_emails`: addresses that may appear in files (all others WARN).
+  - `banned_text`: strings you never want in public copy (WARN).
+  - `require_intake`: WARN when a skill does not start by asking questions.
+  - `projects_dir`, `reports_dir`, `skills_dir`: where staging copies, release
+    reports and installed skills live.
+  - `post_publish_commands`: your own checks after going public, each a list
+    of arguments, for example `[["python3", "~/bin/my_guard.py", "--check"]]`.
 - `private-terms.txt`: names and strings that must never appear in a public
-  repo (people, clients, private repo names, your Wi-Fi name, device serials).
-  One per line; any hit is a FAIL.
+  repo (people, clients, private repo names, your Wi-Fi name, device serials),
+  one per line, every spelling you use (`Acme Rossi`, `acme-rossi`,
+  `ACME_ROSSI`). Any hit is a FAIL. Without this file the scan says so with a
+  WARN.
 - `local.md`: your own rules for Claude, read at the start of every release.
+  It can add or tighten rules, never relax the hard ones.
 
 ## Usage
 
@@ -72,18 +102,20 @@ In Claude Code:
 
 > Make my beer-label skill open source.
 
-> Rendi open source la skill dei collegamenti Arduino.
+> Rendi open source la mia skill delle ricette.
 
 The scanner also works alone:
 
 ```bash
 python3 ~/.claude/skills/skill-release/scripts/release_scan.py scan path/to/staging
-python3 ~/.claude/skills/skill-release/scripts/release_scan.py strip docs/*.jpg docs/*.png
+python3 ~/.claude/skills/skill-release/scripts/release_scan.py strip path/to/staging/docs/hero.jpg
 python3 ~/.claude/skills/skill-release/scripts/repo_settings.py check OWNER/REPO --stage public
 ```
 
 `scan` exits 1 on any FAIL (`--strict` also on WARN), `--json` for machine
-output, `--no-history` and `--no-gitleaks` to skip those parts.
+output, `--no-history` and `--no-gitleaks` to skip those parts. `strip`
+rewrites the files **in place**: run it on the staging copy, naming each file
+(a shell glob that matches nothing stops zsh before the script runs).
 
 ## Security
 
@@ -102,8 +134,11 @@ residual risks: [SECURITY.md](SECURITY.md).
   the process for that reason.
 - Metadata stripping covers JPEG and PNG; other formats are reported and must
   be re-exported.
-- The review agents need Claude Code's Agent tool. Without it, the skill
-  falls back to a single review by Claude itself and says so in the report.
+- The review agents need Claude Code's Agent tool. Without it, Claude works
+  through each reviewer prompt itself and writes in the report that the
+  review was not independent.
+- Isolation is a scratch `HOME`, not a sandbox. To release a skill written by
+  someone else, run the cold-start test on a machine or VM you can throw away.
 - The GitHub settings assume a personal account on github.com.
 
 ## Tests

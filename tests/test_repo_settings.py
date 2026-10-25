@@ -1,5 +1,6 @@
 """Tests for scripts/repo_settings.py with a fake `gh api`."""
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -121,16 +122,76 @@ class RepoSettings(unittest.TestCase):
         ok, detail = rset.check_branch(rset.Repo(NAME, gh), "public")
         self.assertFalse(ok)
 
-    def test_classic_protection_counts(self):
-        gh = FakeGH(visibility="public", classic={"allow_force_pushes": {"enabled": False},
-                                                  "allow_deletions": {"enabled": False}})
+    def test_classic_protection_counts_only_with_admins(self):
+        rule = {"allow_force_pushes": {"enabled": False}, "allow_deletions": {"enabled": False}}
+        gh = FakeGH(visibility="public", classic=dict(rule, enforce_admins={"enabled": True}))
         ok, _ = rset.check_branch(rset.Repo(NAME, gh), "public")
         self.assertTrue(ok)
+        gh = FakeGH(visibility="public", classic=dict(rule, enforce_admins={"enabled": False}))
+        ok, detail = rset.check_branch(rset.Repo(NAME, gh), "public")
+        self.assertFalse(ok)
+        self.assertIn("admins", detail)
 
     def test_bad_repo_names_rejected(self):
         for bad in ("--paginate", "octo", "octo/demo;rm", "../x/y", "octo/de mo"):
             with self.assertRaises(SystemExit):
                 rset.Repo(bad, FakeGH())
+
+
+class PostPublish(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.cfg = os.path.join(self.dir, "config.json")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def write(self, data):
+        with open(self.cfg, "w", encoding="utf-8") as fh:
+            fh.write(data if isinstance(data, str) else json.dumps(data))
+
+    def run_pp(self, codes=()):
+        calls, lines = [], []
+        codes = list(codes)
+
+        class Res:
+            def __init__(self, c):
+                self.returncode = c
+
+        def runner(argv, timeout):
+            calls.append(argv)
+            return Res(codes.pop(0) if codes else 0)
+        code = rset.post_publish(self.cfg, runner=runner, out=lines.append)
+        return code, calls, "\n".join(lines)
+
+    def test_runs_each_command_as_arguments_with_tilde_expanded(self):
+        self.write({"post_publish_commands": [["python3", "~/dir with space/guard.py", "--check"], ["true"]]})
+        code, calls, out = self.run_pp()
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[0][1], os.path.expanduser("~/dir with space/guard.py"))
+        self.assertEqual(len(calls), 2)
+        self.assertIn("RUN", out)
+
+    def test_failure_is_exit_1(self):
+        self.write({"post_publish_commands": [["false"], ["true"]]})
+        code, calls, _ = self.run_pp(codes=[1, 0])
+        self.assertEqual(code, 1)
+        self.assertEqual(len(calls), 2)
+
+    def test_bad_shapes_rejected(self):
+        for bad in ({"post_publish_commands": "rm -rf /"}, {"post_publish_commands": [[]]},
+                    {"post_publish_commands": [["ok", 3]]}):
+            self.write(bad)
+            code, calls, _ = self.run_pp()
+            self.assertEqual((code, calls), (1, []))
+        self.write("{not json")
+        self.assertEqual(self.run_pp()[0], 1)
+
+    def test_missing_config_runs_nothing(self):
+        code, calls, out = self.run_pp()
+        self.assertEqual((code, calls), (0, []))
 
 
 if __name__ == "__main__":

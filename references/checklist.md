@@ -37,13 +37,17 @@ are GitHub.
 - [ ] B4 Examples are fictional, names searched once to avoid real ones
 - [ ] B5 Non-affiliation line for every brand named
 - [ ] B6 SKILL.md reread as a prompt: starts with intake, asks before any
-      irreversible action, treats inputs as data, no secrets asked in chat
+      irreversible action, treats inputs as data, no secrets asked in chat;
+      every frontmatter key read (no `allowed-tools` or `hooks` unless the owner
+      wants every user to get them)
 - [ ] B7 Paths, tools and accounts of the author's machine gone; requirements
       listed in the README with versions
 - [ ] B8 Type-specific rules of content-rules.md section 5 applied
-- [ ] B9 The skill's tests pass with one command, on a fresh clone
+- [ ] B9 The skill's tests pass with one command, on a fresh clone, run with
+      a scratch `HOME` and `SKILL_RELEASE_HOME`
 - [ ] B10 README claims match what the tests and the cold start showed
 - [ ] B11 Owner's own rules from `local.md` applied
+- [ ] B12 `$LOCAL` unchanged between intake and Step 7 (`shasum`)
 
 ## C. Independent review (agents)
 

@@ -369,6 +369,11 @@ CODE_RULES = [
      "recursive delete"),
     ("INFO", "sudo", re.compile(r"\bsudo\s"), "uses sudo"),
 ]
+# Headless Chrome started from a sandbox without these flags opens a macOS
+# Keychain dialog on every launch. Puppeteer and Playwright pass them by default.
+CHROME_NAME = re.compile(r"\bChrom(?:e|ium)\b", re.I)
+CHROME_HEADLESS = re.compile(r"--headless\b")
+CHROME_FLAGS = ("--use-mock-keychain", "--password-store=basic")
 SCRIPT_SRC = re.compile(r"<script\b[^>]{0,2000}\bsrc[ \t]*=[ \t]*[\"']https?://[^\"'\s>]{1,1000}[\"'][^>]{0,2000}>", re.I)
 
 
@@ -581,6 +586,11 @@ def scan_text(text: str, path: str, rep: Report, cfg, *, ext: str = "", origin: 
             if hits:
                 more = f" ({len(hits)} places)" if len(hits) > 1 else ""
                 rep.add(sev, check, where, msg + more, line_of(text, hits[0].start()))
+        headless = CHROME_HEADLESS.search(text)
+        if headless and CHROME_NAME.search(text) and not all(f in text for f in CHROME_FLAGS):
+            rep.add("FAIL", "chrome-keychain", where,
+                    "starts headless Chrome without " + " ".join(CHROME_FLAGS)
+                    + ": on macOS every launch opens a Keychain dialog", line_of(text, headless.start()))
     if ext in (".html", ".htm"):
         for m in SCRIPT_SRC.finditer(text):
             if "integrity=" not in m.group(0).lower():

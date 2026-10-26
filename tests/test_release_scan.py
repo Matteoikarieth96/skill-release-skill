@@ -483,6 +483,15 @@ class Code(Base):
         hits = [f for f in self.scan().findings if f.check == "cdn-without-sri"]
         self.assertEqual(len(hits), 1)
 
+    def test_headless_chrome_needs_keychain_flags(self):
+        chrome = '"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"'
+        write(self.root, "scripts/bad.py", f'cmd = [{chrome}, "--headless=new", "--disable-gpu"]\n')
+        write(self.root, "scripts/ok.py", f'cmd = [{chrome}, "--headless=new", "--use-mock-keychain", '
+                                          '"--password-store=basic"]\n')
+        write(self.root, "scripts/office.py", 'cmd = ["soffice", "--headless", "--convert-to", "pdf"]\n')
+        hits = [f for f in self.scan().findings if f.check == "chrome-keychain"]
+        self.assertEqual([(h.path, h.severity) for h in hits], [("scripts/bad.py", "FAIL")])
+
 
 class History(Base):
     def test_secret_only_in_history(self):

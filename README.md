@@ -170,6 +170,7 @@ checks that each is caught; it also checks that this repo passes its own scan.
 - [portfolio-report](https://github.com/Matteoikarieth96/portfolio-report-skill): an English portfolio report and A4 one-pager from a Fineco export, with a switch to hide the amounts
 - [cartoon-shorts](https://github.com/Matteoikarieth96/cartoon-shorts-skill): animated cartoon shorts (9:16) for YouTube Shorts, TikTok and Reels, interview first, rendered locally
 - [x2d-print](https://github.com/Matteoikarieth96/x2d-print-skill): STL parts to a ready-to-print Bambu Studio project for the Bambu Lab X2D, with a beginner guide
+- [launch-video](https://github.com/Matteoikarieth96/launch-video-skill): launch videos for apps and websites in 16:9 and 9:16, light and dark, rendered locally from the real site
 
 ## Licence
 

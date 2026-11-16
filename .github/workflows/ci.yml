@@ -14,7 +14,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15]
+        # Pinned: ubuntu-latest moved to an image that has no Python 3.9, the oldest version the scripts support.
+        os: [ubuntu-24.04, macos-15]
         python: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4

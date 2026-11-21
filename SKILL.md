@@ -1,6 +1,6 @@
 ---
 name: skill-release
-description: Take a Claude Code skill from a private folder to a public GitHub repo without leaking anything and without shipping something a stranger cannot use. It interviews the owner first, builds a staging copy with fresh git history, removes private data and third-party material, adds licence, README, SECURITY.md and CI from templates, runs an automated scan (secrets, private terms, personal data, photo and PDF metadata, hidden Unicode, symlinks, CI pinning, full history), sends the copy to independent reviewer agents (security, privacy and IP, a cold-start tester who installs it like a stranger), creates the repo private, writes a release report, and goes public only after the owner's explicit yes. Use it whenever the user wants to open source, publish or release a skill, e.g. "make this skill open source", "publish the skill on GitHub", "rendi open source la skill", "pubblica la skill", "prepara la skill per l'open source". Not for app repos or private sharing.
+description: Take a Claude Code skill from a private folder to a public GitHub repo without leaking anything, via a clean staging copy, a scan, reviewers and the owner's yes. Use when the user wants to open source, publish or release a skill, e.g. "rendi open source la skill", "pubblica la skill", "prepara la skill per l'open source", "publish the skill on GitHub". Not for app repos or private sharing.
 ---
 
 # skill-release
